@@ -79,15 +79,20 @@ function go(hash) { location.hash = hash; }
 function bar(frac, big = false) { return h('div', { class: `bar ${big ? 'big' : ''}` }, h('i', { style: { width: `${Math.round((frac || 0) * 100)}%` } })); }
 
 // ------------------------------------------------------------------ router
+let renderSeq = 0;
 async function render() {
   clearPollers();
+  const seq = ++renderSeq;
   const { parts, q } = route();
   document.querySelectorAll('[data-nav]').forEach((a) => a.classList.toggle('active',
     (parts[0] || 'library') === a.dataset.nav || (parts[0] === 'p' && a.dataset.nav === 'library')));
   $app.innerHTML = '';
   $app.append(h('div', { class: 'loading' }, 'Loading…'));
+  // views that know their title only after loading data set it on `page` (grab STATE.page before any await)
+  const page = STATE.page = { title: !parts.length ? 'Library' : { discover: 'Download', jobs: 'Jobs', settings: 'Settings', p: parts[1] }[parts[0]] || 'Not found' };
+  document.title = `${page.title} · recaper`;
+  let view;
   try {
-    let view;
     if (!parts.length) view = await viewLibrary();
     else if (parts[0] === 'discover' && parts.length === 1) view = await viewDiscover(q);
     else if (parts[0] === 'discover') view = await viewManga(parts[1], parts[2], q);
@@ -95,12 +100,14 @@ async function render() {
     else if (parts[0] === 'jobs') view = await viewJobs();
     else if (parts[0] === 'settings') view = await viewSettings();
     else view = h('div', { class: 'empty' }, h('h2', {}, 'Not found'));
-    $app.innerHTML = '';
-    $app.append(view);
   } catch (e) {
-    $app.innerHTML = '';
-    $app.append(h('div', { class: 'empty' }, h('h2', {}, 'Something went wrong'), h('p', {}, e.message)));
+    page.title = 'Error';
+    view = h('div', { class: 'empty' }, h('h2', {}, 'Something went wrong'), h('p', {}, e.message));
   }
+  if (seq !== renderSeq) return; // the user already navigated elsewhere
+  document.title = `${page.title} · recaper`;
+  $app.innerHTML = '';
+  $app.append(view);
 }
 window.addEventListener('hashchange', render);
 
@@ -247,10 +254,12 @@ function licenceBox(m) {
 }
 function numKey(c) { const n = parseFloat(c.number); return Number.isFinite(n) ? n : 1e9; }
 async function viewManga(sid, mid, q) {
+  const page = STATE.page;
   const lang = q.get('lang') || 'en';
   const linkTo = q.get('link') || '';
   const data = await api(`/api/sources/${enc(sid)}/manga/${enc(mid)}?lang=${enc(lang)}`);
   const { manga } = data;
+  page.title = `${manga.title} · Download`;
   const srcs = await sources();
   const source = srcs.find((s) => s.id === sid);
 
@@ -475,8 +484,11 @@ setInterval(refreshBadge, 3000);
 
 // ------------------------------------------------------------------ project
 async function viewProject(name, tab) {
+  const page = STATE.page;
   const p = await api(`/api/projects/${enc(name)}`);
   const tabs = [['make', 'Make video'], ['options', 'Options'], ['script', 'Script'], ['videos', `Videos${p.videos.length ? ` (${p.videos.length})` : ''}`], ['chapters', `Chapters (${p.chapters})`], ['images', 'Images'], ['panels', 'Panels']];
+  const tabLabel = { make: 'Make video', options: 'Options', script: 'Script', videos: 'Videos', chapters: 'Chapters', images: 'Images', panels: 'Panels' }[tab] || 'Make video';
+  page.title = `${p.name} · ${tabLabel}`;
   const body = h('div', {});
   const view = h('div', {},
     h('div', { class: 'phead' },
@@ -514,7 +526,9 @@ async function tabMake(p) {
   for (const [role, spec] of [['Reader', eff.reader], ['Writer', eff.writer]]) {
     const names = spec.split(',').map((s) => s.trim());
     const ok = names.some((n) => {
-      const key = Object.keys(doctor.providers).find((k) => n.startsWith(k.split(':')[0]) || (k === 'deepseek-free' && n.includes('opencode')));
+      const key = Object.keys(doctor.providers).find((k) => n.startsWith(k.split(':')[0])
+        || (k === 'deepseek-free' && n.includes('opencode'))
+        || (k === 'antigravity' && (n === 'agy' || n.startsWith('agy:'))));
       return !key || doctor.providers[key].ok;
     });
     if (!ok) warn.push(`${role} (${spec}) looks unavailable on this machine - check System check.`);
@@ -557,6 +571,142 @@ async function getDoctor(refresh = false) {
   return STATE.doctor;
 }
 
+// Multi-select dropdown for AI model chains (reader / writer).
+let _liveModelsFetched = false;
+function modelsSelect({ schema, value, placeholder, needVision = false, onchange }) {
+  const parse = (v) => (v ? String(v).split(',').map((s) => s.trim()).filter(Boolean) : []);
+  let selected = parse(value);
+  const pills = h('div', { class: 'msel-pills' });
+  const menu = h('div', { class: 'msel-menu', hidden: true });
+  const customInput = h('input', {
+    placeholder: 'Custom model (e.g. antigravity:claude-opus-5-5, ollama:llava)…',
+    onclick: (e) => e.stopPropagation(),
+  });
+  const addCustom = (e) => {
+    e && e.stopPropagation();
+    const parts = parse(customInput.value);
+    if (!parts.length) return;
+    for (const p of parts) { if (!selected.includes(p)) selected.push(p); }
+    customInput.value = '';
+    commit();
+  };
+  customInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addCustom(e); } });
+  const customRow = h('div', { class: 'msel-custom', onclick: (e) => e.stopPropagation() },
+    customInput, h('button', { type: 'button', class: 'small', onclick: addCustom }, '+ Add'));
+
+  const labelMap = () => {
+    const map = new Map();
+    for (const g of schema.model_groups || []) {
+      for (const m of g.models || []) map.set(m.value, m.label);
+    }
+    return map;
+  };
+  const drawPills = () => {
+    pills.innerHTML = '';
+    if (!selected.length) {
+      pills.append(h('span', { class: 'msel-placeholder' }, placeholder));
+      return;
+    }
+    const labels = labelMap();
+    selected.forEach((spec, idx) => {
+      const move = (dir, e) => {
+        e.stopPropagation();
+        const j = idx + dir;
+        if (j < 0 || j >= selected.length) return;
+        [selected[idx], selected[j]] = [selected[j], selected[idx]];
+        commit();
+      };
+      const rm = (e) => {
+        e.stopPropagation();
+        selected.splice(idx, 1);
+        commit();
+      };
+      pills.append(h('span', { class: 'msel-pill', title: spec },
+        h('span', { class: 'msel-ord' }, `${idx + 1}.`),
+        h('span', { class: 'msel-name' }, labels.get(spec) || spec),
+        selected.length > 1 ? h('button', { type: 'button', title: 'Move earlier', disabled: idx === 0, onclick: (e) => move(-1, e) }, '‹') : null,
+        selected.length > 1 ? h('button', { type: 'button', title: 'Move later', disabled: idx === selected.length - 1, onclick: (e) => move(1, e) }, '›') : null,
+        h('button', { type: 'button', title: 'Remove', onclick: rm }, '×')));
+    });
+  };
+  const drawMenu = () => {
+    menu.innerHTML = '';
+    const groups = schema.model_groups || [];
+    const known = new Set();
+    for (const g of groups) {
+      const box = h('div', { class: 'msel-group' }, h('div', { class: 'msel-gtitle' }, g.label));
+      for (const m of g.models || []) {
+        known.add(m.value);
+        const idx = selected.indexOf(m.value);
+        const disabled = needVision && m.vision === false;
+        const cb = h('input', {
+          type: 'checkbox', checked: idx !== -1, disabled,
+          onchange: () => {
+            if (cb.checked) { if (!selected.includes(m.value)) selected.push(m.value); }
+            else selected = selected.filter((x) => x !== m.value);
+            commit();
+          },
+        });
+        box.append(h('label', { class: `msel-opt ${idx !== -1 ? 'on' : ''} ${disabled ? 'disabled' : ''}`, onclick: (e) => e.stopPropagation() },
+          cb,
+          h('span', { class: 'msel-olabel' }, m.label),
+          h('span', { class: 'faint small mono' }, m.value),
+          disabled ? h('span', { class: 'chip tiny warn' }, 'text only') : null,
+          idx !== -1 ? h('span', { class: 'chip tiny accent' }, `#${idx + 1}`) : null));
+      }
+      menu.append(box);
+    }
+    const extras = selected.filter((s) => !known.has(s));
+    if (extras.length) {
+      const box = h('div', { class: 'msel-group' }, h('div', { class: 'msel-gtitle' }, 'Custom'));
+      for (const spec of extras) {
+        const idx = selected.indexOf(spec);
+        const cb = h('input', {
+          type: 'checkbox', checked: true,
+          onchange: () => { selected = selected.filter((x) => x !== spec); commit(); },
+        });
+        box.append(h('label', { class: 'msel-opt on', onclick: (e) => e.stopPropagation() },
+          cb, h('span', { class: 'msel-olabel mono' }, spec), h('span', { class: 'chip tiny accent' }, `#${idx + 1}`)));
+      }
+      menu.append(box);
+    }
+    menu.append(customRow);
+  };
+  const commit = () => {
+    drawPills();
+    if (!menu.hidden) drawMenu();
+    onchange(selected.join(','));
+  };
+  const toggle = (e) => {
+    e.stopPropagation();
+    const open = menu.hidden;
+    document.querySelectorAll('.msel-menu').forEach((m) => { m.hidden = true; });
+    menu.hidden = !open;
+    if (open) {
+      drawMenu();
+      if (!_liveModelsFetched) {
+        _liveModelsFetched = true;
+        api('/api/models?live=true').then((r) => {
+          if (r && r.groups) { schema.model_groups = r.groups; drawPills(); if (!menu.hidden) drawMenu(); }
+        }).catch(() => {});
+      }
+    }
+  };
+  const trigger = h('div', { class: 'msel-box', tabindex: '0', onclick: toggle, onkeydown: (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(e); }
+    else if (e.key === 'Escape') menu.hidden = true;
+  } }, pills, h('span', { class: 'msel-arrow' }, '▾'));
+  drawPills();
+  const root = h('div', { class: 'msel' }, trigger, menu);
+  return {
+    el: root,
+    reset: () => { selected = []; drawPills(); if (!menu.hidden) drawMenu(); },
+  };
+}
+document.addEventListener('click', () => {
+  document.querySelectorAll('.msel-menu').forEach((m) => { m.hidden = true; });
+});
+
 // Shared editor for a project's recaper.toml and the global settings file.
 // values = keys this file sets; base[key] = what applies when the key is left empty; from[key] = 'global' | 'cwd' (else default).
 function optionsEditor({ schema, values, base, from = {}, skip = [], self = null, intro, onSave, toml = '' }) {
@@ -579,6 +729,12 @@ function optionsEditor({ schema, values, base, from = {}, skip = [], self = null
       const box = h('input', { type: 'checkbox', checked: effective, onchange: (e) => onchange(e.target.checked === !!inh ? '' : e.target.checked) });
       input = h('label', { class: 'check' }, box, h('span', {}, `On (${src.toLowerCase()} ${inh ? 'on' : 'off'})`));
       resetUi = () => { box.checked = !!inh; };
+    } else if (o.kind === 'models') {
+      const ms = modelsSelect({
+        schema, value: shown, placeholder: `${src} (${def})`, needVision: o.key === 'reader', onchange,
+      });
+      input = ms.el;
+      resetUi = ms.reset;
     } else if (o.kind === 'color') {
       const presets = o.choices || [];
       const c = shown === '' ? '' : String(shown);

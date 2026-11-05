@@ -155,6 +155,7 @@ uv run recaper doctor --live
 | Spec | Auth | Vision |
 |---|---|---|
 | `claude[:sonnet\|opus\|haiku\|<id>]` (default) | your Claude subscription via the logged-in Claude Code CLI (Agent SDK). If `ANTHROPIC_API_KEY` is set, that key is billed instead. | ✓ |
+| `antigravity[:model]` (alias `agy`) | your Google AI subscription via the local Antigravity ACP server (e.g. `antigravity:gemini-4-argon-high`, `antigravity:gemini-3.8-flash-high`). Run `uv run python -m recaper.llm.antigravity` to list the models on your plan. | ✓ |
 | `gemini[:model]` | `GEMINI_API_KEY` if set, otherwise the logged-in `gemini` CLI. Force with `gemini-api` / `gemini-cli`. | ✓ |
 | `openai[:model]` | `OPENAI_API_KEY` (+ `OPENAI_BASE_URL` for compatible servers) | ✓ |
 | `ollama[:model]` | local Ollama (default `qwen2.5vl:7b`) | ✓ (VL models) |

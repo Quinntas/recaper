@@ -625,3 +625,78 @@ def test_web_settings_and_delete(tmp_path):
     assert "image_sources" not in c.get("/api/projects/B").json()["values"]
     assert c.delete("/api/projects/..").status_code >= 400 and c.delete("/api/projects/.recaper").status_code == 400
     assert (tmp_path / "B").exists() and tmp_path.exists()
+
+
+def test_antigravity_and_models_multiselect(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from recaper.llm import make_chain, make_provider
+    from recaper.llm.antigravity import resolve_model
+    from recaper.web import options as opts
+    from recaper.web.server import create_app
+
+    avail = ["gemini-3.8-flash-high", "gemini-3.8-flash-low", "gemini-4-argon-high", "gemini-4-argon-medium"]
+    assert resolve_model("gemini-4-argon-medium", avail) == "gemini-4-argon-medium"
+    assert resolve_model("gemini-4-argon", avail) == "gemini-4-argon-high"
+    assert resolve_model("argon", avail) == "gemini-4-argon-high"
+    assert resolve_model("flash", avail) == "gemini-3.8-flash-high"
+    p = make_provider("antigravity:gemini-4-argon-high")
+    assert p.name == "antigravity" and p.model == "gemini-4-argon-high" and p.vision
+    chain = make_chain("agy:gemini-4-argon-high,claude:opus", "reader", need_vision=True)
+    assert [x.label() for x in chain.providers] == ["antigravity:gemini-4-argon-high", "claude:opus"]
+
+    sch = opts.schema()
+    by_key = {o["key"]: o for o in sch["options"]}
+    assert by_key["reader"]["kind"] == "models" and by_key["writer"]["kind"] == "models"
+    assert any(g["id"] == "antigravity" for g in sch["model_groups"])
+    assert opts.coerce("reader", ["antigravity:gemini-4-argon-high", " claude:opus ", "antigravity:gemini-4-argon-high"]) == "antigravity:gemini-4-argon-high,claude:opus"
+    with pytest.raises(ValueError, match="can't see images"):
+        opts.write_global({"reader": "deepseek-free"})
+
+    c = TestClient(create_app(tmp_path))
+    assert any(g["id"] == "antigravity" for g in c.get("/api/models").json()["groups"])
+    r = c.put("/api/settings", json={"reader": ["antigravity:gemini-4-argon-high", "claude:sonnet"], "writer": "deepseek-free,antigravity:gemini-3.8-flash-high"})
+    assert r.status_code == 200
+    assert r.json()["saved"] == {"reader": "antigravity:gemini-4-argon-high,claude:sonnet", "writer": "deepseek-free,antigravity:gemini-3.8-flash-high"}
+
+
+def test_refusal_skips_retries_keeps_provider_alive_and_splits_book_chapter():
+    from recaper.bookflow import _digest_prose
+    from recaper.llm import RefusalError, extract_json
+    from recaper.llm.base import is_refusal_message
+
+    msg = "The prompt could not be submitted. The prompt contains sensitive words that violate Google's Generative AI Prohibited Use policy."
+    assert is_refusal_message(msg)
+    assert extract_json('Here is the output:\n```json\n{"a": "line1\nline2", "b": [1, 2,],}\n```\nDone.') == {"a": "line1\nline2", "b": [1, 2]}
+
+    class _SelectiveRefuser(Provider):
+        name = "antigravity"
+
+        def __init__(self):
+            super().__init__("gemini-4-argon-medium")
+            self.calls = 0
+
+        def complete(self, system, parts):
+            self.calls += 1
+            text = "\n".join(p for p in parts if isinstance(p, str))
+            if "FORBIDDEN_WORD" in text:
+                raise RefusalError(msg)
+            return '{"story": true, "title": "Ch", "summary": "Part summary.", "events": [{"desc": "Part event", "chars": ["Rudeus"], "weight": 3}], "characters": [], "terms": []}'
+
+    refuser = _SelectiveRefuser()
+    backup = _Fake("claude", reply='{"ok": "from_backup"}')
+    chain = Chain([refuser, backup], "writer")
+    # 1) Refused prompt fails over immediately (1 call, 0 retries) to backup
+    assert chain.complete_json("s", ["FORBIDDEN_WORD"]) == {"ok": "from_backup"}
+    assert refuser.calls == 1 and backup.calls == 1
+    # 2) Unlike QuotaError, RefusalError does NOT mark the primary provider dead for the next chapter
+    assert chain.complete_json("s", ["clean chapter"])["title"] == "Ch"
+    assert refuser.calls == 2 and backup.calls == 1
+
+    # 3) Single-provider chain on a book chapter with one forbidden passage splits into segments and recovers the rest
+    single = Chain([_SelectiveRefuser()], "writer")
+    words = ["safe"] * 600 + ["FORBIDDEN_WORD"] + ["safe"] * 600
+    res = _digest_prose("c0078", "Turning Point", words, "", single)
+    assert len(res["events"]) >= 2 and "Part summary." in res["summary"]
+
+

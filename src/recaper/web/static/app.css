@@ -127,6 +127,31 @@ label.check { display: inline-flex; gap: 6px; align-items: center; cursor: point
 .opt.changed label::after { content: " •"; color: var(--accent2); }
 .opt .reset { float: right; font-size: 11px; color: var(--faint); cursor: pointer; }
 
+/* multi-select dropdown for AI models */
+.msel { position: relative; }
+.msel-box { display: flex; align-items: center; gap: 8px; min-height: 39px; padding: 5px 10px; border-radius: 9px; border: 1px solid var(--line);
+  background: var(--bg2); color: var(--text); cursor: pointer; user-select: none; }
+.msel-box:hover, .msel-box:focus { border-color: var(--accent); outline: none; }
+.msel-pills { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; min-width: 0; }
+.msel-placeholder { color: var(--muted); padding: 2px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msel-arrow { color: var(--muted); font-size: 12px; flex: none; }
+.msel-pill { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border-radius: 7px; background: var(--panel2);
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line)); font-size: 12.5px; }
+.msel-pill .msel-ord { color: var(--accent2); font-weight: 700; font-size: 11px; }
+.msel-pill button { padding: 0 3px; border: none; background: transparent; color: var(--muted); font-size: 12px; line-height: 1; border-radius: 4px; }
+.msel-pill button:hover:not(:disabled) { color: var(--text); background: var(--bg2); }
+.msel-menu { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 30; max-height: 360px; overflow: auto;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 11px; padding: 8px; box-shadow: var(--shadow); }
+.msel-group + .msel-group { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+.msel-gtitle { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding: 2px 6px 4px; }
+.msel-opt { display: flex !important; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 7px; font-weight: 500 !important; margin: 0 !important; cursor: pointer; }
+.msel-opt:hover:not(.disabled) { background: var(--panel2); }
+.msel-opt.on { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.msel-opt.disabled { opacity: .5; cursor: not-allowed; }
+.msel-olabel { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msel-custom { display: flex; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+.msel-custom input { flex: 1; padding: 5px 8px; font-size: 12.5px; }
+
 /* table */
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }

@@ -152,6 +152,26 @@ def create_app(library: Path) -> FastAPI:
     def options_schema():
         return opts.schema() | {"project_only": sorted(opts.PROJECT_ONLY)}
 
+    @app.get("/api/models")
+    def list_ai_models(live: bool = False):
+        groups = opts.model_catalog()
+        if live:
+            try:
+                from ..llm.antigravity import list_models
+
+                agy = list_models()
+                if agy:
+                    for g in groups:
+                        if g["id"] == "antigravity":
+                            seen = {f"antigravity:{m['id']}" for m in agy}
+                            g["models"] = (
+                                [{"value": f"antigravity:{m['id']}", "label": m["name"], "vision": True} for m in agy]
+                                + [m for m in g["models"] if m["value"] not in seen]
+                            )
+            except Exception:  # noqa: BLE001 - fall back to static catalog
+                pass
+        return {"groups": groups}
+
     # ---------------------------------------------------------------- global settings
     @app.get("/api/settings")
     def get_settings():
@@ -181,7 +201,7 @@ def create_app(library: Path) -> FastAPI:
         from ..tts import ENGINE_CLASSES
 
         providers = {}
-        for spec in ("claude:sonnet", "gemini", "openai", "ollama", "deepseek-free"):
+        for spec in ("claude:sonnet", "antigravity", "gemini", "openai", "ollama", "deepseek-free"):
             from ..config import _expand_aliases
 
             prov = make_provider(_expand_aliases(spec))

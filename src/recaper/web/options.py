@@ -21,6 +21,13 @@ PROVIDERS = [
     "claude:sonnet",
     "claude:opus",
     "claude:haiku",
+    "antigravity:gemini-4-argon-high",
+    "antigravity:gemini-4-argon-medium",
+    "antigravity:gemini-4-argon-low",
+    "antigravity:gemini-3.8-flash-high",
+    "antigravity:gemini-3.8-flash-medium",
+    "antigravity:gemini-3.8-flash-low",
+    "antigravity",
     "gemini",
     "gemini-api:gemini-flash-latest",
     "gemini-cli",
@@ -30,6 +37,34 @@ PROVIDERS = [
     "deepseek-free,claude:sonnet",
     "claude:sonnet,gemini",
 ]
+# Picker for the reader / writer multi-selects: (group id, group label, [(spec, label, vision)]).
+# Antigravity's models can also be refreshed live from the ACP server (see /api/models).
+MODEL_GROUPS: list[tuple[str, str, list[tuple[str, str, bool]]]] = [
+    ("antigravity", "Antigravity (your Google AI subscription)", [
+        ("antigravity:gemini-4-argon-high", "Gemini 4 Argon (High)", True),
+        ("antigravity:gemini-4-argon-medium", "Gemini 4 Argon (Medium)", True),
+        ("antigravity:gemini-4-argon-low", "Gemini 4 Argon (Low)", True),
+        ("antigravity:gemini-3.8-flash-high", "Gemini 3.8 Flash (High)", True),
+        ("antigravity:gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)", True),
+        ("antigravity:gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)", True),
+        ("antigravity", "Antigravity (default model)", True),
+    ]),
+    ("claude", "Claude (your Claude subscription)", [
+        ("claude:sonnet", "Claude Sonnet", True), ("claude:opus", "Claude Opus", True), ("claude:haiku", "Claude Haiku", True),
+    ]),
+    ("gemini", "Gemini (API key or gemini CLI)", [
+        ("gemini", "Gemini (auto)", True), ("gemini-api:gemini-flash-latest", "Gemini Flash (API key)", True),
+        ("gemini-cli", "Gemini CLI", True),
+    ]),
+    ("openai", "OpenAI (API key)", [("openai:gpt-5-mini", "GPT-5 mini", True), ("openai:gpt-5", "GPT-5", True)]),
+    ("ollama", "Ollama (local)", [("ollama:qwen2.5vl:7b", "Qwen2.5-VL 7B", True)]),
+    ("opencode", "OpenCode (free)", [("deepseek-free", "DeepSeek V4.1 Flash (free)", False)]),
+]  # fmt: skip
+
+
+def model_catalog() -> list[dict]:
+    return [{"id": g, "label": label, "models": [{"value": v, "label": l, "vision": vis} for v, l, vis in items]}
+            for g, label, items in MODEL_GROUPS]  # fmt: skip
 KOKORO_VOICES = [
     "am_michael", "am_fenrir", "am_puck", "am_adam", "am_echo", "am_eric", "am_liam", "am_onyx",
     "af_heart", "af_bella", "af_nicole", "af_sarah", "af_sky", "bm_george", "bm_fable", "bm_lewis",
@@ -63,8 +98,8 @@ META: dict[str, tuple] = {
     "outro": ("story", "Closing line", "Optional last line, voiced over the final panel (e.g. a call to action).", "text", None, None),
     "source": ("story", "Source type", "auto detects light novels / books (EPUB, text PDF, TXT), long colour strips (manhwa) and pages (manga).", "select", ["auto", "manga", "manhwa", "book"], None),
     "reading": ("story", "Manga reading order", "Panel order on manga pages. auto = right-to-left for manga.", "select", ["auto", "rtl", "ltr"], None),
-    "reader": ("models", "Reader (vision)", "Model(s) that look at the panels. Comma = fallback chain. Must support images.", "provider", None, PROVIDERS),
-    "writer": ("models", "Writer", "Model(s) that write the narration. Text-only models (deepseek-free) are fine here.", "provider", None, PROVIDERS),
+    "reader": ("models", "Reader (vision)", "Model(s) that look at the panels, tried in order (the next one takes over when one fails or runs out of quota). Must support images.", "models", None, PROVIDERS),
+    "writer": ("models", "Writer", "Model(s) that write the narration, tried in order. Text-only models (DeepSeek free) are fine here.", "models", None, PROVIDERS),
     "jobs": ("models", "Parallel model calls", "Chapters read/written at the same time.", "int", None, None),
     "read_batch": ("models", "Panels per reader call", "Max images per vision request.", "int", None, None),
     "words_per_minute": ("models", "Narration pace (wpm)", "Used to turn minutes into word targets. ~200 at voice speed 1.2.", "int", None, None),
@@ -138,7 +173,8 @@ def schema() -> dict:
              "choices": choices, "suggestions": suggestions}
         )  # fmt: skip
     missing = [k for k, _ in _flat_fields() if k not in META]
-    return {"groups": [{"id": g, "label": label} for g, label in GROUPS], "options": opts, "unlabelled": missing}
+    return {"groups": [{"id": g, "label": label} for g, label in GROUPS], "options": opts,
+            "model_groups": model_catalog(), "unlabelled": missing}  # fmt: skip
 
 
 # ---------------------------------------------------------------- toml io
@@ -192,7 +228,7 @@ def read_file(path: Path) -> dict[str, Any]:
 def coerce(key: str, value: Any) -> Any:
     meta = META.get(key)
     kind = meta[3] if meta else "text"
-    if value is None or (isinstance(value, str) and value == ""):
+    if value is None or (isinstance(value, str) and value == "") or (isinstance(value, list) and not value):
         return None
     if kind == "int":
         return int(value)
@@ -204,6 +240,14 @@ def coerce(key: str, value: Any) -> Any:
         if isinstance(value, str):
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
+    if kind == "models":
+        raw = value if isinstance(value, list) else str(value).split(",")
+        seen: list[str] = []
+        for item in raw:
+            s = str(item).strip()
+            if s and s not in seen:
+                seen.append(s)
+        return ",".join(seen) or None
     return str(value)
 
 
@@ -247,9 +291,12 @@ def write_global(values: dict[str, Any]) -> tuple[dict[str, Any], Path]:
 
 def _check(values: dict[str, Any]) -> None:
     cfg = Config()
-    from ..config import _apply
+    from ..config import _apply, _expand_aliases
+    from ..llm import make_chain
 
     _apply(cfg, values)  # raises on bad keys
+    make_chain(_expand_aliases(cfg.reader), "reader", need_vision=True)
+    make_chain(_expand_aliases(cfg.writer), "writer", need_vision=False)
     if cfg.render.width % 2 or cfg.render.height % 2:
         raise ValueError("width and height must be even")
     from ..render.styles import make_background

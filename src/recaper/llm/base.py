@@ -45,6 +45,27 @@ class UnavailableError(ProviderError):
     """Provider can't run here at all (missing CLI, key, package)."""
 
 
+class RefusalError(ProviderError):
+    """Prompt or output blocked by a content / safety filter: skip retries on this provider, try the next."""
+
+
+REFUSAL_MARKERS = (
+    "prompt could not be submitted",
+    "contains sensitive words",
+    "prohibited use policy",
+    "violate google's",
+    "blocked by safety",
+    "safety settings",
+    "finish_reason: safety",
+    "content policy",
+)
+
+
+def is_refusal_message(text: str) -> bool:
+    t = text.lower()
+    return any(m in t for m in REFUSAL_MARKERS)
+
+
 @dataclass
 class ImagePart:
     path: Path
@@ -95,25 +116,48 @@ def text_only(parts: Sequence[Part]) -> str:
 # ------------------------------------------------------------------ json utils
 
 
-def extract_json(text: str) -> Any:
-    text = text.strip()
-    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
-    candidates = [fence.group(1)] if fence else []
-    candidates.append(text)
-    for c in candidates:
-        c = c.strip()
+_TRAILING_COMMA = re.compile(r",\s*([}\]])")
+
+
+def _try_parse(s: str) -> tuple[bool, Any]:
+    for variant in (s, _TRAILING_COMMA.sub(r"\1", s)):
         try:
-            return json.loads(c)
+            val = json.loads(variant, strict=False)
+            if isinstance(val, (dict, list)):
+                return True, val
         except json.JSONDecodeError:
             pass
-        for open_, close in (("{", "}"), ("[", "]")):
-            a, b = c.find(open_), c.rfind(close)
-            if a != -1 and b > a:
+    return False, None
+
+
+def extract_json(text: str) -> Any:
+    text = text.strip()
+    candidates = [m.group(1) for m in re.finditer(r"```(?:json)?\s*(.*?)```", text, re.S)]
+    if not candidates and (unclosed := re.search(r"```(?:json)?\s*(.*)", text, re.S)):
+        candidates.append(unclosed.group(1))
+    candidates.append(text)
+    decoder = json.JSONDecoder(strict=False)
+    for c in candidates:
+        c = c.strip()
+        ok, val = _try_parse(c)
+        if ok:
+            return val
+        starts = sorted(((c.find(o), o, cl) for o, cl in (("{", "}"), ("[", "]")) if c.find(o) != -1), key=lambda x: x[0])
+        for a, open_, close in starts:
+            b = c.rfind(close)
+            if b > a:
+                ok, val = _try_parse(c[a : b + 1])
+                if ok:
+                    return val
+            for src in (c[a:], _TRAILING_COMMA.sub(r"\1", c[a:])):
                 try:
-                    return json.loads(c[a : b + 1])
+                    val, _ = decoder.raw_decode(src)
+                    if isinstance(val, (dict, list)):
+                        return val
                 except json.JSONDecodeError:
-                    continue
-    raise ProviderError("model did not return valid JSON")
+                    pass
+    preview = re.sub(r"\s+", " ", text)[:140]
+    raise ProviderError(f"model did not return valid JSON (got: {preview!r})")
 
 
 # -------------------------------------------------------------- fallback chain
@@ -140,10 +184,16 @@ class Chain:
             for attempt in range(retries + 1):
                 try:
                     raw = provider.complete(system, parts)
+                    if is_refusal_message(raw):
+                        raise RefusalError(re.sub(r"\s+", " ", raw).strip()[:180])
                     return extract_json(raw)
                 except (QuotaError, UnavailableError) as e:
                     console.print(f"[yellow]{self.role}: {provider.label()} unavailable ({e}); falling back[/]")
                     self._dead.add(idx)
+                    last = e
+                    break
+                except RefusalError as e:
+                    console.print(f"[yellow]{self.role}: {provider.label()} refused this prompt ({e}); trying fallback[/]")
                     last = e
                     break
                 except Exception as e:  # noqa: BLE001 - any provider failure is retryable
@@ -152,13 +202,20 @@ class Chain:
                         self._dead.add(idx)
                         last = QuotaError(str(e))
                         break
+                    if is_refusal_message(str(e)):
+                        console.print(f"[yellow]{self.role}: {provider.label()} refused this prompt ({e}); trying fallback[/]")
+                        last = RefusalError(str(e))
+                        break
                     last = e
-                    wait = 5 * 2**attempt  # 5, 10, 20s: rides out rate limits from parallel calls
-                    console.print(f"[yellow]{self.role}: {provider.label()} failed ({e}); retry {attempt + 1}/{retries} in {wait}s[/]")
-                    time.sleep(wait)
+                    if attempt < retries:
+                        wait = 5 * 2**attempt  # 5, 10, 20s: rides out rate limits from parallel calls
+                        console.print(f"[yellow]{self.role}: {provider.label()} failed ({e}); retry {attempt + 1}/{retries} in {wait}s[/]")
+                        time.sleep(wait)
         if isinstance(last, QuotaError) and len(self._dead) == len(self.providers):
             raise QuotaError(
                 f"every {self.role} provider is out of quota ({last}). Wait for the reset or add a fallback, "
                 f"e.g. --{self.role} {self.describe().replace(' -> ', ',')},gemini. Finished work is cached; re-run to resume."
             )
+        if isinstance(last, RefusalError):
+            raise RefusalError(f"all {self.role} providers refused this prompt: {last}")
         raise ProviderError(f"all {self.role} providers failed: {last}")

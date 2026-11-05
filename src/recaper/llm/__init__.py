@@ -7,11 +7,12 @@
   ollama[:model]                            local Ollama
   opencode[:provider/model]                 OpenCode CLI, e.g. opencode:opencode/deepseek-v4.1-flash-free
   deepseek-free                             alias for the line above
+  antigravity[:model]                       Antigravity via your Google AI login, e.g. antigravity:gemini-4-argon-high
 """
 
 from __future__ import annotations
 
-from .base import Chain, ImagePart, Provider, ProviderError, QuotaError, UnavailableError, extract_json
+from .base import Chain, ImagePart, Provider, ProviderError, QuotaError, RefusalError, UnavailableError, extract_json
 
 
 def make_provider(spec: str) -> Provider:
@@ -39,6 +40,10 @@ def make_provider(spec: str) -> Provider:
         from .opencode import OpencodeProvider
 
         return OpencodeProvider(model)
+    if name in ("antigravity", "agy"):
+        from .antigravity import AntigravityProvider
+
+        return AntigravityProvider(model)
     raise ValueError(f"unknown provider {name!r} in spec {spec!r}")
 
 
@@ -61,6 +66,7 @@ __all__ = [
     "Provider",
     "ProviderError",
     "QuotaError",
+    "RefusalError",
     "UnavailableError",
     "extract_json",
     "make_chain",

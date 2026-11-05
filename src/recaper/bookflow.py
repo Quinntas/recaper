@@ -27,7 +27,7 @@ from . import imagegen, progress, prompts
 from .books import BookChapter, extract
 from .config import Config, parse_chapter_ranges
 from .ingest import Chapter
-from .llm import Chain, ImagePart
+from .llm import Chain, ImagePart, RefusalError
 from .log import console
 from .panels import Panel, imread, imwrite
 from .story import Bible, _clean_text, _norm_label, _read_tiles, reconcile_bible
@@ -102,6 +102,50 @@ def _illustration_panels(ch: Chapter, work: Path) -> list[Panel]:
 # -------------------------------------------------------------------- read
 
 
+def _as_digest_dict(val: Any, title: str) -> dict:
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, list):
+        if len(val) == 1 and isinstance(val[0], dict) and ("events" in val[0] or "summary" in val[0]):
+            return val[0]
+        return {"story": True, "title": title, "summary": "", "events": [e for e in val if isinstance(e, dict)], "characters": [], "terms": []}
+    return {"story": True, "title": title, "summary": "", "events": [], "characters": [], "terms": []}
+
+
+def _digest_prose(cid: str, title: str, words: list[str], bible_text: str, writer: Chain) -> dict:
+    """Digest chapter prose; if a content filter refuses the full chapter, split into smaller chunks and merge."""
+    capped = words[:MAX_PROSE_WORDS]
+    header = f"STORY BIBLE:\n{bible_text or '(empty - first chapter)'}\n\nCHAPTER: {title}\n\nTEXT:\n"
+    prose = " ".join(capped) + (" [...]" if len(words) > MAX_PROSE_WORDS else "")
+    try:
+        return _as_digest_dict(writer.complete_json(prompts.BOOK_DIGEST_SYSTEM, [header + prose]), title)
+    except RefusalError:
+        console.print(f"[yellow]{cid}: chapter text triggered content filter; splitting into segments to skip filtered passage[/]")
+
+    def _split_attempt(chunk: list[str], depth: int) -> list[dict]:
+        try:
+            return [_as_digest_dict(writer.complete_json(prompts.BOOK_DIGEST_SYSTEM, [header + " ".join(chunk)]), title)]
+        except RefusalError:
+            if depth >= 2 or len(chunk) < 400:
+                console.print(f"[yellow]{cid}: skipping {len(chunk)}-word segment refused by content filter[/]")
+                return []
+            mid = len(chunk) // 2
+            return _split_attempt(chunk[:mid], depth + 1) + _split_attempt(chunk[mid:], depth + 1)
+
+    mid = len(capped) // 2
+    parts = (_split_attempt(capped[:mid], 1) + _split_attempt(capped[mid:], 1)) if mid >= 200 else []
+    if not parts:
+        return {"story": True, "title": title, "summary": f"Events of {title}.", "events": [{"desc": f"Key events in {title}.", "chars": [], "weight": 2}], "characters": [], "terms": []}
+    return {
+        "story": any(p.get("story", True) is not False for p in parts),
+        "title": next((p["title"] for p in parts if p.get("title")), title),
+        "summary": " ".join(str(p.get("summary", "")).strip() for p in parts if p.get("summary")).strip(),
+        "events": [e for p in parts for e in (p.get("events") or [])],
+        "characters": [c for p in parts for c in (p.get("characters") or [])],
+        "terms": [t for p in parts for t in (p.get("terms") or [])],
+    }
+
+
 def _read_book_chapter(ch: Chapter, bk: BookChapter, panels: list[Panel], bible_text: str, reader: Chain, writer: Chain, work: Path) -> dict:
     path = work / "notes" / f"{ch.cid}.json"
     if path.exists():
@@ -126,9 +170,8 @@ def _read_book_chapter(ch: Chapter, bk: BookChapter, panels: list[Panel], bible_
         panel_notes.setdefault(lab, {"story": True, "weight": 2, "desc": "illustration", "chars": []})
 
     words = bk.text.split()
-    prose = " ".join(words[:MAX_PROSE_WORDS]) + (" [...]" if len(words) > MAX_PROSE_WORDS else "")
     console.print(f"  digesting {ch.cid} ({len(words)} words)")
-    res = writer.complete_json(prompts.BOOK_DIGEST_SYSTEM, [f"STORY BIBLE:\n{bible_text or '(empty - first chapter)'}\n\nCHAPTER: {bk.title}\n\nTEXT:\n{prose}"])
+    res = _digest_prose(ch.cid, bk.title, words, bible_text, writer)
     events = []
     for i, e in enumerate(res.get("events") or [], start=1):
         if e.get("desc"):
