@@ -1,0 +1,354 @@
+"""Stage orchestration with on-disk caching under <input>/.recaper/.
+
+Stages: panels -> read -> script -> voice -> render. Every stage reuses what's already on disk,
+so a crashed or interrupted run resumes, and editing script.json only re-voices / re-renders
+the beats that changed.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
+from pathlib import Path
+
+import numpy as np
+import soundfile as sf
+
+from .config import WORK_DIR_NAME, Config, parse_chapter_ranges
+from .books import is_book_project
+from .ingest import Chapter, detect_source, discover
+from .llm import make_chain
+from . import progress
+from .log import console
+from .panels import Panel, contact_sheet, extract_chapter, panels_stale
+from .story import (
+    Bible,
+    chapter_word_targets,
+    positions,
+    previous_context,
+    read_chapter,
+    reconcile_bible,
+    story_before,
+    write_chapter,
+    write_hook,
+)
+from .tts import Voice, load_audio, voice_all
+
+STAGES = ["panels", "read", "script", "voice", "render"]
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").lower() or "recap"
+
+
+def _fmt_ts(seconds: float) -> str:
+    s = int(seconds)
+    h, m, s = s // 3600, (s % 3600) // 60, s % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+class Project:
+    def __init__(self, input_dir: Path, cfg: Config):
+        self.input_dir = input_dir.resolve()
+        self.cfg = cfg
+        self.work = self.input_dir / WORK_DIR_NAME
+        self.work.mkdir(exist_ok=True)
+        self.chapters: list[Chapter] = []
+        self.selected: list[Chapter] = []
+        self.panels: dict[str, list[Panel]] = {}
+        self.source = cfg.source
+        self.book_chapters: list = []
+
+    # ----------------------------------------------------------------- utils
+    def force(self, stages: list[str]) -> None:
+        targets = {
+            "panels": ["panels", "read_tiles", "notes", "script", "script.json", "manifest.json"],
+            "read": ["notes", "script", "script.json"],
+            "script": ["script", "script.json"],
+            "voice": ["audio"],
+            "render": ["render"],
+        }
+        for st in stages:
+            for name in targets.get(st, []):
+                p = self.work / name
+                if p.is_dir():
+                    shutil.rmtree(p)
+                elif p.exists():
+                    p.unlink()
+
+    def _selection_key(self) -> str:
+        sel = [c.cid for c in self.selected]
+        blob = json.dumps([sel, self.cfg.lang, self.cfg.minutes_per_chapter, self.cfg.target_minutes, self.cfg.extra_instructions])
+        return hashlib.sha1(blob.encode()).hexdigest()[:10]
+
+    # ---------------------------------------------------------------- panels
+    def stage_panels(self, preview: bool = False) -> None:
+        if self.source == "book" or (self.source == "auto" and is_book_project(self.input_dir)):
+            from . import bookflow
+
+            bookflow.book_panels(self)
+            if preview:
+                for ch in self.selected:
+                    if self.panels.get(ch.cid):
+                        contact_sheet(self.panels[ch.cid], self.work, self.work / "preview" / f"{ch.cid}.jpg")
+            return
+        self.chapters = discover(self.input_dir, self.work)
+        if not self.chapters:
+            raise SystemExit(f"No chapters found in {self.input_dir}. Put chapter folders / .cbz / .pdf / images there.")
+        manifest_path = self.work / "manifest.json"
+        old = json.loads(manifest_path.read_text("utf-8")) if manifest_path.exists() else {}
+
+        if self.source == "auto":
+            self.source = old.get("source") or detect_source(self.chapters)
+        reading = self.cfg.reading
+        rtl = (reading == "rtl") or (reading == "auto" and self.source == "manga")
+
+        # invalidate caches of chapters whose identity changed (e.g. a chapter was inserted)
+        old_titles = old.get("chapters", {})
+        for ch in self.chapters:
+            if ch.cid in old_titles and old_titles[ch.cid] != f"{ch.title}|{len(ch.pages)}":
+                console.print(f"[yellow]{ch.cid} changed ({old_titles[ch.cid]} -> {ch.title}); re-processing it[/]")
+                shutil.rmtree(self.work / "panels" / ch.cid, ignore_errors=True)
+                for f in [self.work / "notes" / f"{ch.cid}.json", *(self.work / "script").glob(f"{ch.cid}_*.json")]:
+                    f.unlink(missing_ok=True)
+                (self.work / "script.json").unlink(missing_ok=True)
+        manifest_path.write_text(
+            json.dumps({"source": self.source, "chapters": {c.cid: f"{c.title}|{len(c.pages)}" for c in self.chapters}}, indent=1),
+            "utf-8",
+        )
+
+        idx = parse_chapter_ranges(self.cfg.chapters, len(self.chapters))
+        self.selected = [self.chapters[i] for i in idx]
+        console.print(
+            f"[bold]{len(self.chapters)} chapters[/] found, {len(self.selected)} selected - "
+            f"source: [bold]{self.source}[/]{' (right-to-left)' if self.source == 'manga' and rtl else ''}"
+        )
+        # notes for chapter N depend on chapters before it, so we always read from the first selected chapter on
+        for i, ch in enumerate(self.selected, start=1):
+            if panels_stale(ch, self.source, rtl, self.work, self.cfg.panels):
+                console.print(f"[yellow]{ch.cid}: panel settings changed - re-cutting it and re-reading its panels[/]")
+                (self.work / "notes" / f"{ch.cid}.json").unlink(missing_ok=True)
+                for f in (self.work / "script").glob(f"{ch.cid}_*.json"):
+                    f.unlink()
+                (self.work / "script.json").unlink(missing_ok=True)
+            panels = extract_chapter(ch, self.source, rtl, self.work, self.cfg.panels)
+            self.panels[ch.cid] = panels
+            progress.emit("panels", i, len(self.selected), f"{ch.title}: {len(panels)} panels")
+            console.print(f"  {ch.cid} [dim]{ch.title}[/]: {len(ch.pages)} pages -> {len(panels)} panels")
+            if preview:
+                contact_sheet(panels, self.work, self.work / "preview" / f"{ch.cid}.jpg")
+        if preview:
+            console.print(f"panel previews: {self.work / 'preview'}")
+
+    # ----------------------------------------------------------------- story
+    def stage_script(self, until_read: bool = False) -> dict:
+        script_path = self.work / "script.json"
+        key = self._selection_key()
+        # hook/outro only affect assembly: they must not invalidate the (expensive) chapter scripts
+        assembly = key + hashlib.sha1(
+            json.dumps([self.cfg.hook, self.cfg.hook_words, self.cfg.outro, self.cfg.image_sources, asdict(self.cfg.images)]).encode()
+        ).hexdigest()[:6]
+        if script_path.exists():
+            existing = json.loads(script_path.read_text("utf-8"))
+            if existing.get("selection") == assembly:
+                console.print(f"using existing script: {script_path}")
+                return existing
+            console.print("[yellow]chapter selection / length / language changed - reassembling script.json[/]")
+
+        reader = make_chain(self.cfg.reader, "reader", need_vision=True)
+        writer = make_chain(self.cfg.writer, "writer", need_vision=False)
+        for chain in (reader, writer):
+            for p in chain.providers:
+                try:
+                    p.check()
+                except Exception as e:  # noqa: BLE001
+                    console.print(f"[yellow]{chain.role}: {p.label()} looks unavailable: {e}[/]")
+
+        if self.source == "book":
+            from . import bookflow
+
+            res = bookflow.book_script(self, reader, writer, key, until_read)
+            if res is None:
+                return {}
+            hook, chapters_out = res["hook"], res["chapters"]
+        else:
+            res = self._manga_script(reader, writer, key, until_read)
+            if res is None:
+                return {}
+            hook, chapters_out = res
+        if self.cfg.outro.strip() and chapters_out and chapters_out[-1]["beats"]:
+            last = chapters_out[-1]["beats"][-1]
+            chapters_out[-1]["beats"] = [*chapters_out[-1]["beats"], {"text": self.cfg.outro.strip(), "panels": last["panels"][-1:], "emphasis": "normal"}]
+
+        script = {
+            "title": self.cfg.title or self.input_dir.name,
+            "lang": self.cfg.lang,
+            "selection": assembly,
+            "hook": hook,
+            "chapters": chapters_out,
+        }
+        script_path.write_text(json.dumps(script, ensure_ascii=False, indent=1), "utf-8")
+        words = sum(len(b["text"].split()) for c in [{"beats": hook}, *chapters_out] for b in c["beats"])
+        console.print(
+            f"script: {script_path}  ({words} words, ~{words / self.cfg.words_per_minute:.0f} min) - "
+            "edit it freely, then re-run to voice/render the changes"
+        )
+        return script
+
+
+    def _manga_script(self, reader, writer, key: str, until_read: bool):
+        """Manga / manhwa: read panels -> notes -> beats. Returns (hook, chapters) or None after reading."""
+        t0 = time.time()
+        jobs = max(1, self.cfg.jobs)
+        console.print(f"[bold]reading[/] with {reader.describe()} ({jobs} parallel)")
+        chapters = self.selected
+        notes_by_cid: dict[str, dict] = {}
+        # Chapter 1 first so the main cast is named; the rest in parallel with that bible as context.
+        progress.emit("read", 0, len(chapters), f"reading {chapters[0].title}")
+        first = read_chapter(chapters[0], self.panels[chapters[0].cid], "", reader, self.cfg, self.work)
+        notes_by_cid[first["cid"]] = first
+        progress.emit("read", 1, len(chapters), chapters[0].title)
+        seed = Bible()
+        seed.merge(first.get("characters"), first.get("terms"))
+        with ThreadPoolExecutor(jobs) as pool:
+            futs = {
+                pool.submit(read_chapter, ch, self.panels[ch.cid], seed.text(), reader, self.cfg, self.work): ch.cid
+                for ch in chapters[1:]
+            }
+            for fut in as_completed(futs):
+                notes_by_cid[futs[fut]] = fut.result()
+                progress.emit("read", len(notes_by_cid), len(chapters), futs[fut])
+        all_notes = [notes_by_cid[ch.cid] for ch in chapters]
+        bible = reconcile_bible(all_notes, writer, self.work)
+        console.print(f"  read {len(all_notes)} chapters in {time.time() - t0:.0f}s; bible: {len(bible.characters)} characters")
+        if until_read:
+            return None
+
+        t0 = time.time()
+        console.print(f"[bold]writing[/] ({self.cfg.lang}) with {writer.describe()} ({jobs} parallel)")
+        targets = chapter_word_targets(all_notes, self.cfg)
+        pos = positions(len(all_notes))
+        script_dir = self.work / "script"
+        with ThreadPoolExecutor(jobs) as pool:
+            hook_fut = (
+                pool.submit(write_hook, all_notes, bible, writer, self.cfg, script_dir / f"hook_{key}_{self.cfg.hook_words}.json")
+                if self.cfg.hook
+                else None
+            )
+            beat_futs = [
+                pool.submit(
+                    write_chapter, notes, position, story_before(all_notes, i), previous_context(all_notes, i),
+                    words, bible, writer, self.cfg,
+                    script_dir / f"{notes['cid']}_{position}_{words}_{self.cfg.lang}_{key}.json",
+                )  # fmt: skip
+                for i, (notes, words, position) in enumerate(zip(all_notes, targets, pos))
+            ]
+            todo = [f for f in (hook_fut, *beat_futs) if f is not None]
+            progress.emit("script", 0, len(todo), "writing")
+            for k, f in enumerate(as_completed(todo), start=1):
+                f.result()
+                progress.emit("script", k, len(todo), "written")
+            chapters_out = [
+                {"cid": n["cid"], "title": n["title"], "beats": f.result()} for n, f in zip(all_notes, beat_futs)
+            ]
+            hook = hook_fut.result() if hook_fut else []
+        console.print(f"  wrote {len(chapters_out)} chapters + hook in {time.time() - t0:.0f}s")
+        return hook, chapters_out
+
+    # ----------------------------------------------------------------- voice
+    def stage_voice(self, script: dict) -> tuple[list[dict], Path, list[tuple[float, str]]]:
+        tcfg = self.cfg.tts
+        voice = Voice(tcfg, self.cfg.lang, self.work / "audio")
+        sections = [("Intro", script.get("hook", []))] + [(c["title"], c["beats"]) for c in script["chapters"]]
+        all_beats = [b for _, beats in sections for b in beats]
+        console.print(f"[bold]voice[/]: {len(all_beats)} beats with {tcfg.engine} ({voice.voice or 'default voice'})")
+
+        t0 = time.time()
+
+        def voiced(i: int, n: int) -> None:
+            progress.emit("voice", i, n, "voicing")
+            if i % 25 == 0 or i == n:
+                console.print(f"  voiced {i}/{n} new")
+
+        progress.emit("voice", 0, len(all_beats), "loading voice")
+        paths = voice_all(tcfg, self.cfg.lang, self.work / "audio", [b["text"] for b in all_beats], voiced)
+        flat = [(b, si) for si, (_, beats) in enumerate(sections) for b in beats]
+        clips: list[tuple[Path, dict, int]] = [(p, b, si) for p, (b, si) in zip(paths, flat)]
+        console.print(f"  voice ready in {time.time() - t0:.0f}s")
+
+        sr = sf.info(str(clips[0][0])).samplerate if clips else 24000
+        t = 0.3
+        timed: list[dict] = []
+        markers: list[tuple[float, str]] = []
+        placements: list[tuple[int, np.ndarray]] = []
+        last_section = -1
+        for path, beat, si in clips:
+            if si != last_section:
+                if last_section != -1:
+                    t += tcfg.chapter_gap
+                if sections[si][1]:
+                    markers.append((0.0 if not markers else t, sections[si][0]))
+                last_section = si
+            audio = load_audio(path, sr)
+            placements.append((int(t * sr), audio))
+            timed.append({"start": t, "end": 0.0, "panels": beat["panels"], "emphasis": beat.get("emphasis", "normal")})
+            t += len(audio) / sr + tcfg.beat_gap
+        total = t + 0.8
+        for i, b in enumerate(timed):
+            b["end"] = timed[i + 1]["start"] if i + 1 < len(timed) else total
+        if timed:
+            timed[0]["start"] = 0.0
+
+        buf = np.zeros(int(total * sr) + sr, np.float32)
+        for start, audio in placements:
+            buf[start : start + len(audio)] += audio
+        buf = buf[: int(total * sr)]
+        narration = self.work / "narration.wav"
+        sf.write(str(narration), buf, sr)
+        console.print(f"narration: {total / 60:.1f} min")
+        return timed, narration, markers
+
+    # ---------------------------------------------------------------- render
+    def stage_render(self, timed: list[dict], narration: Path, markers: list[tuple[float, str]], out: Path | None) -> Path:
+        from .render import render_video
+
+        style = self.cfg.render.style
+        if style == "auto":
+            style = "motion" if self.source == "manga" else "blurfill"
+        panel_meta = {p.id: asdict(p) for plist in self.panels.values() for p in plist}
+        missing = {pid for b in timed for pid in b["panels"] if pid not in panel_meta}
+        if missing:
+            # script may reference panels of chapters outside the current selection (e.g. the hook)
+            for pj in (self.work / "panels").glob("*/panels.json"):
+                for p in json.loads(pj.read_text("utf-8")):
+                    panel_meta.setdefault(p["id"], p)
+            still = {pid for pid in missing if pid not in panel_meta}
+            if still:
+                console.print(f"[yellow]dropping unknown panel ids from script: {sorted(still)[:5]}...[/]")
+                for b in timed:
+                    b["panels"] = [p for p in b["panels"] if p in panel_meta]
+                timed = [b for b in timed if b["panels"]] or timed
+
+        title = self.cfg.title or self.input_dir.name
+        out = out or self.input_dir / f"{_slug(title)}_recap.mp4"
+        total = timed[-1]["end"]
+
+        # chapter markers: YouTube description text + embedded mp4 chapters
+        yt = "\n".join(f"{_fmt_ts(ts)} {name}" for ts, name in markers)
+        out.with_suffix(".chapters.txt").write_text(yt + "\n", "utf-8")
+        meta = self.work / "chapters.ffmeta"
+        lines = [";FFMETADATA1", f"title={title}"]
+        for i, (ts, name) in enumerate(markers):
+            end = markers[i + 1][0] if i + 1 < len(markers) else total
+            lines += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={int(ts * 1000)}", f"END={int(end * 1000)}", f"title={name}"]
+        meta.write_text("\n".join(lines) + "\n", "utf-8")
+
+        render_video(timed, panel_meta, style, self.cfg.render, narration, meta, out, self.work)
+        console.print(f"[bold green]done:[/] {out}")
+        progress.emit("done", 1, 1, "video ready", output=str(out))
+        return out

@@ -217,5 +217,3 @@ uv run pytest
 uv run python tests/fixtures.py samples   # synthetic manga + manhwa for a quick end-to-end run
 uv run recaper run samples/manga --mpc 0.6
 ```
-#   r e c a p e r  
- 

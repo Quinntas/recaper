@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>recaper</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%237c5cff'/><path d='M10 9h7a5 5 0 0 1 0 10h-3l5 5' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/><path d='M10 9v15' stroke='white' stroke-width='3' stroke-linecap='round'/></svg>">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/">
+      <span class="logo">R</span><span>recaper</span>
+    </a>
+    <nav>
+      <a href="#/" data-nav="library">Library</a>
+      <a href="#/discover" data-nav="discover">Download</a>
+      <a href="#/jobs" data-nav="jobs">Jobs <span class="badge" id="jobs-badge" hidden></span></a>
+      <a href="#/settings" data-nav="settings">Settings</a>
+    </nav>
+    <button class="ghost" id="doctor-btn" title="System check">System check</button>
+  </header>
+  <main id="app"><div class="loading">Loading…</div></main>
+  <div id="toasts"></div>
+  <div id="modal-root"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

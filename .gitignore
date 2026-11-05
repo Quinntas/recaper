@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.recaper/
+/recap/
+*_recap.mp4
+*.chapters.txt
+/library/
+.env
