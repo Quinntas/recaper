@@ -810,6 +810,11 @@ const LENGTHS = [[1.2, 'Short', 'fast-paced'], [2.5, 'Standard', 'like most reca
 const PARTS = [[0, 'One video'], [15, '~15 min parts'], [20, '~20 min parts'], [30, '~30 min parts'], [60, '~1 h parts']];
 const RESOLUTIONS = [['1920x1080', '1080p'], ['1280x720', '720p'], ['2560x1440', '1440p'], ['3840x2160', '4K'], ['1080x1920', 'Vertical (Shorts)']];
 
+// 'Ch 0337 - Confession' -> 337 (same rule as story.chapter_number)
+function chapterNumber(title) {
+  const m = /(?:\b(?:ch|chap|chapter|ep|episode|vol|volume)\.?\s*|#)(\d+(?:\.\d+)?)/i.exec(title || '') || /\d+(?:\.\d+)?/.exec(title || '');
+  return m ? Number(m[1] ?? m[0]) : null;
+}
 function stepCard(n, title, aside, ...body) {
   return h('section', { class: 'card step' },
     h('div', { class: 'stephead' }, h('span', { class: 'stepn' }, n), h('h2', {}, title), h('div', { class: 'spacer' }), aside),
@@ -854,7 +859,8 @@ async function tabMake(p) {
   // ---- 1. chapters
   const chapterLine = h('span', { class: 'muted' });
   let ready = false;
-  const picker = chapterPicker(p, index, () => { if (ready) { drawChapterLine(); drawSummary(); refreshEstimate(); } });
+  let onChaptersChanged = () => {};
+  const picker = chapterPicker(p, index, () => { if (ready) { drawChapterLine(); drawSummary(); refreshEstimate(); onChaptersChanged(); } });
   const pickerBox = h('div', { hidden: !index.selection && picker.count() === index.chapters.length });
   const pickBtn = h('button', { type: 'button', class: 'small', onclick: () => { pickerBox.hidden = !pickerBox.hidden; drawChapterLine(); } });
   const drawChapterLine = () => {
@@ -922,7 +928,27 @@ async function tabMake(p) {
   // ---- 4. length
   const mpcNow = Number(eff('minutes_per_chapter') || 2.5);
   const mpc = rangeInput({ range: [0.5, 6, 0.1], value: values.minutes_per_chapter ?? '', inh: p.inherited.minutes_per_chapter, onchange: (v) => setOpt('minutes_per_chapter', v) });
-  const lengthStep = stepCard(4, 'Length', null,
+  // story: intro summary + who the narration is written for
+  const hookBox = h('input', { type: 'checkbox', checked: eff('hook') !== false, onchange: (e) => { setOpt('hook', e.target.checked); } });
+  const knownHint = h('div', { class: 'help' });
+  const drawKnown = () => {
+    const mode = eff('known_story') || 'auto';
+    if (mode !== 'auto') { knownHint.textContent = 'Changing this rewrites the script (panel reading is kept).'; return; }
+    const first = index.chapters.find((c) => picker.spec() ? parseSpec(picker.spec(), index.chapters.length).has(c.n) : true);
+    const num = first ? chapterNumber(first.title) : null;
+    const fans = !!first && (first.n > 1 || (num !== null && num > 1));
+    knownHint.textContent = first ? `Auto: ${fans ? `writes for fans - the video starts at "${first.title}"` : 'introduces the characters - the video starts at the beginning'}.` : '';
+  };
+  onChaptersChanged = drawKnown;
+  const knownSeg = segmented([['auto', 'Auto'], ['yes', 'Fans', 'already know the story'], ['no', 'New viewers', 'introduce characters']],
+    eff('known_story') || 'auto', (v) => { setOpt('known_story', v === 'auto' ? '' : v); drawKnown(); });
+  drawKnown();
+  const lengthStep = stepCard(4, 'Story & length', null,
+    h('div', { class: 'grid2s' },
+      h('div', { class: 'opt' }, h('label', {}, 'Written for'), knownSeg, knownHint),
+      h('div', { class: 'opt' }, h('label', {}, 'Intro summary'),
+        h('label', { class: 'check switch' }, hookBox, h('span', {}, 'Open with a 20-35 s summary of the best moments')),
+        h('div', { class: 'help' }, 'The cold open before the first chapter. Turning it on or off is quick: chapters stay as written.'))),
     h('div', { class: 'grid2s' },
       h('div', { class: 'opt' }, h('label', {}, 'Story per chapter'),
         segmented(LENGTHS.map(([v, l, s]) => [v, l, `${v} min · ${s}`]), LENGTHS.some(([v]) => v === mpcNow) ? mpcNow : '', (v) => {
@@ -969,6 +995,7 @@ async function tabMake(p) {
       row('Look', `${STYLE_CARDS.find(([id]) => id === st)?.[1] || st}${resolved(st) === 'motion' ? ` · ${eff('render.background') || 'paper'}` : ''} · ${eff('render.height') || 1080}p`),
       row('Voice', `${v.includes('_') ? v.split('_')[1] : v} · ${Number(eff('tts.speed') || 1).toFixed(2)}×`),
       row('Length', `${eff('minutes_per_chapter') || 2.5} min / chapter${Number(eff('episode_minutes')) ? ` · ~${eff('episode_minutes')} min parts` : ''}`),
+      row('Story', `${eff('hook') === false ? 'no intro' : 'intro summary'} · ${{ yes: 'for fans', no: 'for new viewers' }[eff('known_story')] || 'audience auto'}`),
       row('Models', `${short(eff('reader'))} reads · ${short(eff('writer'))} writes${eff('polisher') ? ` · ${short(eff('polisher'))} polishes` : ''}`));
   };
   let estSeq = 0;
@@ -1342,7 +1369,7 @@ function multiSelect({ load, value, placeholder, onchange }) {
 
 // Shared editor for a project's recaper.toml and the global settings file.
 // options shown in the Essentials view (everything else is under All options or search)
-const ESSENTIAL_OPTIONS = new Set(['lang', 'minutes_per_chapter', 'target_minutes', 'episode_minutes', 'extra_instructions', 'hook', 'outro', 'reader', 'writer', 'polisher',
+const ESSENTIAL_OPTIONS = new Set(['lang', 'minutes_per_chapter', 'target_minutes', 'episode_minutes', 'extra_instructions', 'hook', 'known_story', 'outro', 'reader', 'writer', 'polisher',
   'tts.engine', 'tts.voice', 'tts.speed', 'render.style', 'render.width', 'render.height', 'render.background', 'render.layout', 'render.quality', 'images.generator']);
 function optionsEditor({ schema, values, base, from = {}, skip = [], self = null, intro, onSave, toml = '' }) {
   const fromLabel = (k) => ({ global: 'Global', cwd: 'Folder' }[from[k]] || 'Default');

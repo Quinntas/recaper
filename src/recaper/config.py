@@ -120,7 +120,8 @@ class Config:
     read_batch: int = int(os.environ.get("RECAPER_READ_BATCH", "36"))  # max panel images per reader call
     jobs: int = 6  # parallel model calls (chapters read / written concurrently)
     extra_instructions: str = ""  # appended to the writer prompt (tone, nicknames, etc.)
-    hook: bool = True  # open with a cold-open hook
+    hook: bool = True  # open with a cold-open hook (the short intro summary)
+    known_story: str = "auto"  # viewers already know the story: auto (when the chapters start mid-series) | yes | no
     hook_words: int = 110  # hook length target (hard cap +20%)
     outro: str = ""  # optional closing line voiced at the very end (e.g. a call to action)
     polish: bool = True  # one editing pass per chapter: removes repeated tics, varies openings, checks names

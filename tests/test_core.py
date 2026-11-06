@@ -1031,3 +1031,42 @@ def test_polisher_voices_look_preview_and_pace(samples, tmp_path):
     e = c.get("/api/projects/Manga/estimate?chapters=1").json()
     assert e["chapters"] == 1
     assert c.get("/api/projects/Manga/estimate?chapters=1;rm").status_code == 400
+
+
+def test_human_style_known_audience_and_intro_toggle(samples, tmp_path):
+    import shutil as _sh
+
+    from recaper import pipeline, prompts
+    from recaper.story import chapter_number, known_audience, style_checks
+
+    # AI tells and glued epithets are flagged for the polish pass; the old "turn every 3rd sentence" nag is gone
+    beats = [{"text": "Deep inside the estate, the fragile calm shatters as Beans, the frantic bean-headed secretary, bursts in."},
+             {"text": "Cheadle, the sharp-tongued new chairman, stands. Little did they know what lies ahead."}]
+    checks = " ".join(style_checks(beats, "en"))
+    assert "fragile calm" in checks and "little did" in checks and "Beans, the frantic" in checks and "turn" not in checks
+    assert style_checks([{"text": "Gon climbs the tree and Killua follows him up."}], "en") == []
+    assert "every third sentence" not in prompts.STYLE_GUIDE and "vivid tag" not in prompts.STYLE_GUIDE  # old AI-ish rules
+
+    # fans vs new viewers
+    assert chapter_number("Ch 0337 - Confession") == 337 and chapter_number("Volume 3") == 3 and chapter_number("Prologue") is None
+    assert known_audience(Config(), "Ch 0337 - Confession", 0) and not known_audience(Config(), "Chapter 1", 0)
+    assert known_audience(Config(), "Chapter 4", 3) and known_audience(Config(chapters="20-30"), "Chapter 1", 0)
+    assert not known_audience(Config(known_story="no"), "Ch 0337", 5) and known_audience(Config(known_story="yes"), "Chapter 1", 0)
+    kw = dict(language="en", target_words=200, bible_text="", story_so_far="", prev_context="", chapter_title="t", notes_text="", extra="")
+    fan, new = prompts.writer_user(position="first", known=True, **kw), prompts.writer_user(position="first", known=False, **kw)
+    assert "Do NOT introduce anyone" in fan and "no introductions" in fan
+    assert "Do NOT introduce anyone" not in new and "who the protagonist is" in new
+
+    # the audience is part of the writing cache key (scripts are rewritten when it flips), resolved once per run
+    _sh.copytree(samples / "manga", tmp_path / "Manga")
+    keys = {}
+    for mode in ("auto", "yes", "no"):
+        proj = pipeline.Project(tmp_path / "Manga", Config(known_story=mode))
+        proj.stage_panels()
+        keys[mode] = proj._selection_key()
+        assert proj.cfg.known_story in ("yes", "no")
+    assert keys["auto"] == keys["no"] != keys["yes"]  # sample chapters start at "Chapter 1"
+    later = pipeline.Project(tmp_path / "Manga", Config(chapters="2-3"))
+    later.stage_panels()
+    later._selection_key()
+    assert later.cfg.known_story == "yes"

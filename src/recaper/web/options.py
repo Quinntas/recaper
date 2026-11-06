@@ -93,7 +93,8 @@ META: dict[str, tuple] = {
     "target_minutes": ("story", "Total length target (min)", "Overrides minutes per chapter when set; length is spread by chapter weight.", "number", None, None),
     "chapters": ("story", "Chapter selection", "e.g. 1-20 or 1-5,8. Empty = all.", "text", None, None),
     "extra_instructions": ("story", "Extra directions for the writer", "Tone, nicknames, things to emphasise or skip.", "textarea", None, None),
-    "hook": ("story", "Cold-open hook", "Start the video with a 20-35 s hook built from the most striking moments.", "bool", None, None),
+    "hook": ("story", "Intro summary (cold open)", "Start the video with a 20-35 s intro built from the most striking moments. Turning it off only re-assembles the script.", "bool", None, None),
+    "known_story": ("story", "Viewers already know the story", "yes = no character introductions or re-explained backstory, powers and terms, like a fan recap of a later arc. auto = yes when the chosen chapters don't start at the series' beginning (e.g. a project starting at Ch 337, or chapters 50+). Changing it rewrites the script.", "select", ["auto", "yes", "no"], None),
     "hook_words": ("story", "Hook length (words)", "Target length of the hook (hard cap +20%).", "int", None, None),
     "polish": ("story", "Polish pass", "One extra writer call per chapter that line-edits the script: fixes present-tense \"tells/asks\", repeated openers and phrases, too few turns, over-long sentences and names that drift from the bible. Panels stay the same.", "bool", None, None),
     "episode_minutes": ("story", "Split into parts (minutes)", "Long recaps become several videos of about this length (whole chapters, _part01.mp4, _part02.mp4…). 0 = one video.", "number", None, None),
@@ -199,6 +200,7 @@ UI: dict[str, dict] = {
     "source": {"labels": {"auto": "Auto-detect", "manga": "Manga (pages)", "manhwa": "Manhwa / webtoon (long strips)",
                           "book": "Book / light novel (prose)"}},  # fmt: skip
     "reading": {"labels": {"auto": "Auto (right-to-left for manga)", "rtl": "Right-to-left (Japanese)", "ltr": "Left-to-right"}},
+    "known_story": {"labels": {"auto": "Auto (yes when starting mid-series)", "yes": "Yes - write for fans, no introductions", "no": "No - introduce characters for new viewers"}},
     "jobs": {"range": [1, 16, 1]},
     "read_batch": {"range": [4, 60, 1]},
     "words_per_minute": {"range": [140, 260, 5]},

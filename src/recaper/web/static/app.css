@@ -319,3 +319,11 @@ button.wide { justify-content: center; }
   .topbar nav { min-width: 0; overflow-x: auto; }
   .phead { flex-wrap: wrap; }
 }
+
+/* on/off switch (a styled checkbox) */
+label.switch input { appearance: none; -webkit-appearance: none; width: 36px; height: 20px; border-radius: 999px; flex: none; margin: 0;
+  background: var(--panel2); border: 1px solid var(--line); position: relative; cursor: pointer; transition: background .15s; }
+label.switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%;
+  background: var(--muted); transition: transform .15s, background .15s; }
+label.switch input:checked { background: var(--accent); border-color: var(--accent); }
+label.switch input:checked::after { transform: translateX(16px); background: #fff; }

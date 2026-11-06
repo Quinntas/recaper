@@ -64,30 +64,56 @@ The panels follow."""
 
 # ----------------------------------------------------------------- writer pass
 
-STYLE_GUIDE = """NARRATION STYLE (follow closely - modelled on the top recap channels):
-- You are a gripping storyteller narrating a recap video. Strictly third person, never "I"/"my":
-  convert first-person narration boxes ("My name is X") into third person ("His name is X").
-- Tense: narrate the action in the present ("Tanaka grabs his sword"), but ALWAYS report speech
-  and thoughts in the past: "he told her that...", "she asked whether...", "he realized that..."
-  (never "he tells / she asks"). Backstory in the past.
-- SENTENCES FLOW: average about 18 words (most between 12 and 26, none over 35), linked with
-  "and", "as", "since", "even though"; build momentum inside a sentence instead of chopping it up.
-  Only an occasional short punch sentence ("Silence.") at a real peak - never several in a row.
-- Interpret, don't transcribe: explain motives, inner thoughts, stakes and what moments MEAN.
-  Paraphrase dialogue as reported speech; at most one short direct quote every several beats,
-  only for punchlines, threats or iconic lines.
-- Momentum: roughly every third sentence turns the story - open it with "But", "However",
-  "Little did he know", "Unfortunately", or deliver a reveal or complication. Leave small open
-  loops and pay them off.
-- Rhetorical questions: at most ONE per chapter, and only as the final cliffhanger.
-- Introduce each character the first time with a vivid tag ("Yui, the guild's ice-cold prodigy").
-- Written for the ear: no lists, no parentheses, no emojis, no markdown, no symbols the voice
-  can't read; spell out unusual abbreviations.
-- Sound-effect beats are allowed sparingly ("Then - thud.").
-- Never mention panels, pages, chapters, the author, scans, or "this manga/manhwa". Never address
-  the viewer except in the opening hook and the final outro.
-- Skip filler; compress repetitive fights into their key turns; linger on reveals and emotional peaks.
+# bump when the writing rules change: cached chapter scripts are rewritten (panel notes are kept)
+STYLE_VERSION = 2
+
+STYLE_GUIDE = """NARRATION STYLE - sound like a real person who loves this series telling a friend what happened, the way
+the best human-made recap channels do. Not a novelist, not a movie trailer, not an AI.
+- Plain, specific words. Say what actually happens: who does what, why, and what it changes. Concrete verbs
+  beat adjectives; one adjective on a noun at most, and usually none.
+- Use names. Once someone is known, just say "Gon" or "Killua" - never re-attach a description or title every
+  time ("Gon's father Ging", "the frail blind girl Komugi", "Isaac Netero's son Beyond Netero" are wrong once
+  the viewer knows who they are).
+- Natural rhythm: mix short and long sentences the way people talk; contractions are fine ("he's", "doesn't").
+  Linking words like "so", "and then", "turns out", "which means", "the thing is", "anyway" are welcome in
+  moderation.
+- A little personality: an occasional dry aside or honest reaction ("which, to be fair, is a terrible plan",
+  "and yeah, it works") - at most once or twice a chapter, never forced.
+- Strictly third person for the story, never "I/my" from a character: turn first-person captions into third
+  person ("His name is X").
+- Tense: tell the action in the present ("Gon climbs the tree"); report what people said or thought in the past
+  ("he told her that...", "she asked whether...", "he realized that..."); backstory in the past.
+- Interpret, don't transcribe: explain motives and why a moment matters, briefly. Paraphrase dialogue; quote
+  directly only for a line fans would remember.
+- Twists land on their own; don't announce them. No "Little did he know", no "But fate had other plans".
+- No rhetorical questions, except at most one at the very end of the whole video.
+- Never use these AI tells: "little did", "a testament to", "tapestry", "unwavering", "in a world where",
+  "sends shivers", "chilling", "spine-tingling", "palpable", "delve", "embark", "journey" (unless literal),
+  "realm" (unless literal), "unimaginable", "the stage is set", "what lies ahead", "only time will tell",
+  "dare to", "fragile calm", "shatters the silence", "hangs in the balance", "looms", "a sense of",
+  "it's not just X, it's Y", "not only... but also", "every fiber of", "heart pounding", "the air thick with",
+  "eternal", "destiny", "fate itself". No grand closing morals ("proving that true strength...").
+- No triple lists for rhythm ("bold, brilliant, and brutal"), no stacked dramatic fragments, no purple
+  descriptions of weather, light or tea.
+- Written for the ear: no lists, parentheses, emojis, markdown, or symbols the voice can't read.
+- Never mention panels, pages, chapters, the author, scans or "this manga". Don't address the viewer except in
+  the opening hook and the final outro.
+- Skip filler, compress repetitive fights to their key turns, and slow down for the big reveals and emotional
+  moments.
 - Keep names EXACTLY as in the story bible."""
+
+NEW_AUDIENCE = """AUDIENCE: viewers may be new to the series. The first time a character matters, say in a few plain words who
+they are (to the protagonist), then just use the name."""
+
+KNOWN_AUDIENCE = """AUDIENCE: the viewers are fans who already know the series up to this point - the characters, their
+relationships, powers, terms and earlier arcs. Do NOT introduce anyone, re-explain who they are, recap their
+backstory or explain established abilities and terms; refer to everyone by name like a fan would. Only explain
+things that are NEW in these chapters."""
+
+
+def audience(known: bool) -> str:
+    return KNOWN_AUDIENCE if known else NEW_AUDIENCE
+
 
 WRITER_SYSTEM = """You write narration scripts for long-form manga/manhwa recap videos.
 The script is split into BEATS. Each beat = 1-2 sentences of narration (roughly 15-40 words)
@@ -117,16 +143,21 @@ def writer_user(
     notes_text: str,
     position: str,
     extra: str,
+    known: bool = False,
 ) -> str:
+    start = ("Viewers already know the story up to here: open straight in the current situation (one sentence on where "
+             "things stand, at most), no introductions." if known else
+             "Start by grounding the viewer: who the protagonist is and their situation, briefly, then the chapter's events.")
     position_rules = {
-        "first": "This is the FIRST chapter of the video (the cold-open hook is written separately and plays right before you). "
-        "Start by grounding the viewer: who the protagonist is, their situation and world, then the chapter's events.",
+        "first": "This is the FIRST chapter of the video (the cold-open hook is written separately and plays right before you). " + start,
         "middle": "Continue seamlessly from the previous narration - no recap of what was already said, no greeting.",
-        "last": "This is the FINAL chapter of the video. Continue seamlessly, then end on the strongest open question "
-        'or cliffhanger (e.g. "will they make it out alive? We\'ll soon find out.") followed by one short outro line.',
-        "only": "This is the ONLY chapter of the video. Ground the viewer first, and end on a cliffhanger question plus one short outro line.",
+        "last": "This is the FINAL chapter of the video. Continue seamlessly and end on the cliffhanger as a plain statement "
+        "of where things stand, then one short, casual outro line.",
+        "only": "This is the ONLY chapter of the video. " + start + " End on the cliffhanger as a plain statement, then one short outro line.",
     }[position]
     return f"""{STYLE_GUIDE}
+
+{audience(known)}
 
 WRITE IN: {lang_name(language)} (natural, native-sounding narration; keep character names as in the bible).
 LENGTH: about {target_words} words of narration for this chapter (+-15%).
@@ -157,16 +188,21 @@ Proven patterns (pick the strongest for this story):
    then pull back ("But to understand how he got here...").
 3. Premise sell: the absurd/high-stakes premise in two sentences, then the question it raises.
 
-Do not spoil the ending or the biggest twist. Address the viewer at most once.
+Write it like a person, not a trailer voice: plain words, no "In a world where", no stacked dramatic
+fragments. Do not spoil the ending or the biggest twist. Address the viewer at most once.
 One rhetorical question at most, as the very last line.
+If the viewers already know the series (see AUDIENCE), don't sell the premise or introduce anyone: hook them
+with what is at stake in THESE chapters.
 Choose 3-6 striking panels from anywhere in the notes to show (they may come from later chapters).
 
 Reply with ONLY a JSON object: {"beats": [{"text": "...", "panels": ["c0002:P14"], "emphasis": "hit"}]}
 Panel labels here are qualified with the chapter id, e.g. "c0002:P14"."""
 
 
-def hook_user(language: str, bible_text: str, synopsis: str, highlights: str, extra: str) -> str:
+def hook_user(language: str, bible_text: str, synopsis: str, highlights: str, extra: str, known: bool = False) -> str:
     return f"""{STYLE_GUIDE}
+
+{audience(known)}
 
 WRITE IN: {lang_name(language)}.
 {('EXTRA DIRECTIONS FROM THE CREATOR: ' + extra) if extra else ''}
@@ -251,7 +287,8 @@ Reply with ONLY a JSON object: {"beats": [{"text": "...", "panels": ["id"], "emp
 
 POLISH_SYSTEM = """You are the line editor of a recap video's narration. You get one chapter of the script as
 numbered beats, the story bible and a list of problems an automatic check found. Rewrite the text of the beats
-so the narration reads like a top recap channel - same story, same facts, same order, same beat count.
+so the narration sounds like a real person telling the story - not like AI - with the same story, facts, order
+and beat count.
 
 """ + STYLE_GUIDE + """
 
@@ -259,7 +296,8 @@ What to fix (only where needed - leave good beats untouched):
 - the problems listed under CHECKS;
 - speech and thoughts reported in the present ("he tells her", "she asks") -> past ("he told her", "she asked");
 - the same word or phrase opening several sentences, repeated pet phrases and tics across beats;
-- too few turns: make roughly every third sentence turn the story ("But", "However", a reveal, a complication);
+- AI-sounding writing: the banned phrases above, stacked adjectives, a description glued to a name the
+  viewer already knows, dramatic fragments, grand morals, rhetorical questions;
 - names that differ from the bible (use the bible's exact spelling);
 - clunky, choppy or over-long sentences.
 
@@ -284,8 +322,8 @@ def polish_user(language: str, bible_text: str, title: str, numbered: str, check
 
 
 PREVIOUSLY_SYSTEM = """You write the "previously on" opening of part {PART} of a multi-part recap video series.
-In about {WORDS} words across 2-4 beats, remind viewers of the story so far: the protagonist, the key turns and
-where things stood at the end of the last part - so the new part makes sense on its own. Start with a short
-line like "Previously," then storytell in the same style as the rest of the series (third person, flowing
-sentences, no questions). For pictures pick 1-2 ids per beat from the IMAGES list.
+In about {WORDS} words across 2-4 beats, remind viewers of the story so far: the key turns and where things
+stood at the end of the last part - so the new part makes sense on its own. Start with a short line like
+"Previously," then tell it plainly, like a person catching a friend up (third person, no questions, no
+dramatic trailer voice). For pictures pick 1-2 ids per beat from the IMAGES list.
 Reply with ONLY a JSON object: {"beats": [{"text": "...", "panels": ["id"], "emphasis": "normal"}]}"""

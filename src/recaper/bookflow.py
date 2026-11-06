@@ -352,6 +352,7 @@ def write_book_chapter(notes: dict, related: list[dict], position: str, story_so
     user = prompts.writer_user(
         language=cfg.lang, target_words=words, bible_text=bible.text(), story_so_far=story_so_far, prev_context=prev_context,
         chapter_title=notes["title"], notes_text=combined, position=position, extra=cfg.extra_instructions,
+        known=cfg.known_story == "yes",
     )  # fmt: skip
     console.print(f"  writing {notes['cid']} (~{words} words)")
     res = writer.complete_json(prompts.BOOK_WRITER_SYSTEM, [user])
@@ -640,7 +641,7 @@ def hook_from_beats(chapters_out: list[dict], bible: Bible, writer: Chain, cfg: 
             for pid in b["panels"][:1]:
                 if pid in valid:
                     used.append(f"{pid}: {b['text'][:140]}")
-    user = f"{prompts.STYLE_GUIDE}\n\nWRITE IN: {prompts.lang_name(cfg.lang)}.\n\nSTORY BIBLE:\n{bible.text()}\n\nSCRIPT SO FAR (by chapter):\n{synopsis[:14000]}\n\nUSED IMAGES (id: the line it illustrates):\n" + "\n".join(used[:150])
+    user = f"{prompts.STYLE_GUIDE}\n\n{prompts.audience(cfg.known_story == 'yes')}\n\nWRITE IN: {prompts.lang_name(cfg.lang)}.\n\nSTORY BIBLE:\n{bible.text()}\n\nSCRIPT SO FAR (by chapter):\n{synopsis[:14000]}\n\nUSED IMAGES (id: the line it illustrates):\n" + "\n".join(used[:150])
     res = writer.complete_json(prompts.BOOK_HOOK_SYSTEM.replace("{WORDS}", str(cfg.hook_words)), [user])
     beats, total = [], 0
     for b in res.get("beats") or []:

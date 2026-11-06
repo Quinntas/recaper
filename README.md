@@ -33,7 +33,8 @@ uv run recaper ui -L D:\recaps       # any library folder (one sub-folder per se
      panels**, background swatches and resolution (1080p, 720p, 4K, vertical Shorts…).
   3. **Narration**: language, voice (the selected engine's voices, narration-language voices first) with a
      **▶ sample** at the chosen speed, and speed.
-  4. **Length**: Short / Standard / Detailed per chapter, and splitting long recaps into parts.
+  4. **Story & length**: who the narration is written for (Auto / Fans / New viewers), the **intro summary**
+     on or off, Short / Standard / Detailed per chapter, and splitting long recaps into parts.
 
   These quick settings save straight into the project's options. The summary shows the estimated video length
   (calibrated on the project's last narration) and the model calls left to make. **⚡ Quick preview** renders the
@@ -143,7 +144,15 @@ Everything is in the UI's Options tab (and `recaper.toml`). Beyond story, models
   current panel, or any `#rrggbb`), multi-panel layout (clean = at most two panels, never overlapping / cascade / row), panel reveal (progressive /
   together), card border, shadow strength, camera motion, hit effect, animation speed, frame fill, max
   upscale, background blur and brightness.
-- **Story:** cold-open hook on/off, hook length, and a closing line voiced over the last panel.
+- **Story:** intro summary (cold-open hook) on/off, its length, and a closing line voiced over the last panel.
+- **Writing style:** the narration is written to sound like a person telling a friend what happened (plain
+  words, names instead of re-attached descriptions, the odd aside), with a list of AI tells it must avoid
+  ("little did", "a testament to", "fragile calm shatters"…). The polish pass checks for them too.
+- **Viewers already know the story** (`known_story`: auto / yes / no): for later arcs, the script doesn't
+  introduce characters or re-explain backstory, powers and terms; it writes for fans and only explains what is
+  new. *auto* turns it on when the chosen chapters don't start at the series' beginning (a project starting at
+  "Ch 337", or picking chapters 50+). Changing it, or a new writing style, rewrites the chapter scripts; panel
+  reading is kept.
 - **Polish pass** (`polish`, on by default): after writing, one extra call per chapter line-edits the
   script, by the writer or by a separate **polisher** model (`polisher`, CLI `--polisher claude:sonnet`): a
   local writer drafts, a stronger model edits. Its calls show on their own row of the usage estimate. A local checker first lists what to fix: speech reported in the present ("he tells her"), sentences

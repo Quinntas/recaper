@@ -83,7 +83,15 @@ class Project:
 
     def _selection_key(self) -> str:
         sel = [c.cid for c in self.selected]
-        blob = json.dumps([sel, self.cfg.lang, self.cfg.minutes_per_chapter, self.cfg.target_minutes, self.cfg.extra_instructions])
+        from . import prompts
+        from .story import known_audience
+
+        # resolve "auto" once for this run: every writer call (chapters, hook, books) reads cfg.known_story
+        first = self.selected[0] if self.selected else None
+        known = known_audience(self.cfg, first.title if first else None, first.index if first else 0)
+        self.cfg.known_story = "yes" if known else "no"
+        blob = json.dumps([sel, self.cfg.lang, self.cfg.minutes_per_chapter, self.cfg.target_minutes, self.cfg.extra_instructions,
+                           prompts.STYLE_VERSION, known])
         return hashlib.sha1(blob.encode()).hexdigest()[:10]
 
     # ---------------------------------------------------------------- panels

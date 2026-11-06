@@ -307,6 +307,7 @@ def write_chapter(
         notes_text=_notes_text(chapter_notes),
         position=position,
         extra=cfg.extra_instructions,
+        known=cfg.known_story == "yes",
     )
     console.print(f"  writing {chapter_notes['cid']} (~{target_words} words)")
     res = writer.complete_json(prompts.WRITER_SYSTEM, [user])
@@ -317,6 +318,32 @@ def write_chapter(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"beats": beats}, ensure_ascii=False, indent=1), "utf-8")
     return beats
+
+
+_CH_NUM = re.compile(r"(?:\b(?:ch|chap|chapter|ep|episode|vol|volume)\.?\s*|#)(\d+(?:\.\d+)?)", re.I)
+
+
+def chapter_number(title: str) -> float | None:
+    """'Ch 0337 - Confession' -> 337; 'Volume 3' -> 3; first number in the title otherwise."""
+    m = _CH_NUM.search(title or "")
+    if m:
+        return float(m.group(1))
+    m = re.search(r"\d+(?:\.\d+)?", title or "")
+    return float(m.group(0)) if m else None
+
+
+def known_audience(cfg: Config, first_title: str | None, first_index: int) -> bool:
+    """Do the viewers already know the story? auto = the chapters picked don't start at the series' beginning."""
+    mode = str(cfg.known_story or "auto").strip().lower()
+    if mode in ("yes", "on", "true", "1"):
+        return True
+    if mode in ("no", "off", "false", "0"):
+        return False
+    m = re.match(r"\s*(\d+)", cfg.chapters or "")
+    if first_index > 0 or (m and int(m.group(1)) > 1):  # the selection skips the project's first chapters
+        return True
+    n = chapter_number(first_title or "")
+    return n is not None and n > 1  # e.g. a project that starts at "Ch 337"
 
 
 def write_hook(all_notes: list[dict], bible: Bible, writer: Chain, cfg: Config, path: Path) -> list[dict]:
@@ -333,7 +360,8 @@ def write_hook(all_notes: list[dict], bible: Bible, writer: Chain, cfg: Config, 
             for lab, x in list(n["panels"].items())[:6]:
                 if x["story"]:
                     highlights.append(f"{n['cid']}:{lab}: {x['desc']}")
-    user = prompts.hook_user(cfg.lang, bible.text(), synopsis[:12000], "\n".join(highlights[:80]), cfg.extra_instructions)
+    user = prompts.hook_user(cfg.lang, bible.text(), synopsis[:12000], "\n".join(highlights[:80]), cfg.extra_instructions,
+                             known=cfg.known_story == "yes")
     console.print("  writing cold-open hook")
     res = writer.complete_json(prompts.HOOK_SYSTEM.replace("{WORDS}", str(cfg.hook_words)), [user])
     by_cid = {n["cid"]: n["labels"] for n in all_notes}
@@ -383,7 +411,14 @@ def positions(n: int) -> list[str]:
 _PRESENT_SPEECH = re.compile(
     r"\b(?:he|she|they|it|[A-Z][a-z]+)\s+(tells|asks|says|explains|replies|answers|shouts|whispers|thinks|realizes|realises|wonders|admits|insists|warns|promises|mutters|yells|declares)\b"
 )
-_TURNS = re.compile(r"^(but|however|yet|unfortunately|little did|then again|instead|still|meanwhile|suddenly|just as|only)\b", re.I)
+# AI tells: phrases readers instantly recognise as machine-written (English); the polish pass rewrites them
+_AI_TELLS = re.compile(
+    r"\b(little did|a testament to|tapestry|unwavering|in a world where|sends? shivers|chilling|spine-tingling|palpable|"
+    r"delves?|embarks?|unimaginable|the stage is set|what lies ahead|only time will tell|dares? to|fragile calm|"
+    r"shatters? the silence|hangs? in the balance|looms?|a sense of|every fiber|heart[- ]pounding|the air (?:is |was )?thick|"
+    r"eternal|destiny|fate itself|not only\b.{0,60}\bbut also|it'?s not just\b)",
+    re.I,
+)
 
 
 def _sentences(text: str) -> list[str]:
@@ -415,9 +450,13 @@ def style_checks(beats: list[dict], lang: str) -> list[str]:
     rep = [f'"{w}" x{n}' for w, n in sorted(openers.items(), key=lambda x: -x[1]) if n >= max(3, len(sents) // 6)]
     if rep:
         out.append("sentences repeatedly open with " + ", ".join(rep[:5]))
-    turns = sum(bool(_TURNS.match(s)) for s in sents)
-    if len(sents) >= 9 and turns < len(sents) / 6:
-        out.append(f"only {turns} turn(s) in {len(sents)} sentences (aim for about one every three)")
+    tells = sorted({m.group(0).lower() for b in beats for m in _AI_TELLS.finditer(b["text"])})
+    if tells:
+        out.append("AI-sounding phrases to rewrite plainly: " + ", ".join(f'"{t}"' for t in tells[:10]))
+    # "Beans, the frantic bean-headed secretary," - one such tag can help a new viewer; several read as AI
+    tags = [m.group(0) for b in beats for m in re.finditer(r"\b[A-Z][a-z]+, (?:the|a|an|his|her|their) [^,.;!?]{3,60},", b["text"])]
+    if len(tags) >= 2:
+        out.append("descriptions glued to names (just use the name): " + ", ".join(f'"{x}"' for x in tags[:5]))
     words: dict[str, int] = {}
     for b in beats:
         for phrase in re.findall(r"\b(?:\w+\s){2}\w+\b", b["text"].lower()):
