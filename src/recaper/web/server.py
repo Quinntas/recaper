@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -39,6 +40,15 @@ class RunBody(BaseModel):
     output: str | None = None
     quick: bool = False  # first ~60 s at 480p
     chapters: str | None = None  # e.g. "1-5,8" (1-based, pipeline order); None = the project's setting
+
+
+class VoiceSampleBody(BaseModel):
+    engine: str = "kokoro"
+    voice: str | None = None
+    speed: float = 1.0
+    lang: str = "en"
+    args: dict[str, Any] = {}
+    text: str | None = None
 
 
 class CreateBody(BaseModel):
@@ -268,7 +278,8 @@ def create_app(library: Path) -> FastAPI:
             "values": opts.read_values(p),
             "inherited": opts.inherited(p),
             "inherited_from": opts.inherited_from(p),
-            "effective": {"reader": cfg.reader, "writer": cfg.writer, "style": cfg.render.style},
+            "effective": {"reader": cfg.reader, "writer": cfg.writer, "polisher": cfg.polisher, "style": cfg.render.style,
+                          "lang": cfg.lang, "tts": {"engine": cfg.tts.engine, "voice": cfg.tts.voice, "speed": cfg.tts.speed}},
             "videos_detail": videos(p),
             "previews": [f.name for f in previews],
             "bible": bible,
@@ -449,6 +460,102 @@ def create_app(library: Path) -> FastAPI:
         return job.view()
 
     # ---------------------------------------------------------------- chapter index / viewer
+    # ---------------------------------------------------------------- voices + look previews
+    from . import voices as voice_ui
+
+    sampler = voice_ui.Sampler()
+
+    @app.get("/api/voices")
+    def list_voices(engine: str = "kokoro", lang: str = "en"):
+        return voice_ui.catalog(engine, lang)
+
+    @app.post("/api/voice-sample")
+    def voice_sample(body: VoiceSampleBody):
+        if not 0.3 <= body.speed <= 3.0:
+            raise HTTPException(400, "speed must be between 0.3 and 3")
+        try:
+            path = sampler.sample(body.engine, body.voice, body.speed, body.lang, body.args, body.text)
+        except Exception as e:  # noqa: BLE001 - engine not installed, bad voice, no API key...
+            msg = str(e).strip().splitlines()[-1] if str(e).strip() else type(e).__name__
+            raise HTTPException(400, f"couldn't voice a sample: {msg[:300]}") from e
+        return {"url": f"/api/voice-sample/{path.name}"}
+
+    @app.get("/api/voice-sample/{fname}")
+    def voice_sample_file(fname: str):
+        if not re.match(r"^[0-9a-f]{20}\.wav$", fname) or not (voice_ui.SAMPLE_DIR / fname).exists():
+            raise HTTPException(404, "no such sample")
+        return FileResponse(voice_ui.SAMPLE_DIR / fname, media_type="audio/wav", headers={"Cache-Control": "max-age=86400"})
+
+    look_cache: dict[tuple, bytes] = {}
+
+    def _preview_panels(p: Path) -> list[tuple[str, int, int]]:
+        """A few real panels of the project (cut panels if a run made them, else the first pages)."""
+        import cv2
+
+        work = p / WORK_DIR_NAME
+        out = []
+        for pj in sorted((work / "panels").glob("c*/panels.json"))[:3]:
+            for item in json.loads(pj.read_text("utf-8"))[1:12]:
+                out.append((str(work / item["file"]), item["w"], item["h"]))
+            if len(out) >= 6:
+                return out
+        from ..ingest import entry_pages, list_entries
+
+        for e in list_entries(p)[:1]:
+            for page in entry_pages(e, work)[:6]:
+                img = cv2.imdecode(np.fromfile(str(page), np.uint8), cv2.IMREAD_REDUCED_COLOR_2)
+                if img is not None:
+                    out.append((str(page), img.shape[1] * 2, img.shape[0] * 2))
+        return out
+
+    @app.get("/api/projects/{name}/look-preview")
+    def look_preview(name: str, style: str = "", background: str = "", layout: str = "", width: int = 640):
+        """One rendered frame of the chosen look, made from this project's own panels."""
+        import cv2
+
+        from ..render.styles import Look, PanelInfo, Shot, make_style
+
+        p = project_dir(name)
+        cfg = Config.load(p, {})
+        r = cfg.render
+        style = style or r.style
+        if style == "auto":
+            manifest = p / WORK_DIR_NAME / "manifest.json"
+            src = json.loads(manifest.read_text("utf-8")).get("source") if manifest.exists() else cfg.source
+            style = "blurfill" if src in ("manhwa", "book") else "motion"
+        if style not in ("motion", "blurfill"):
+            raise HTTPException(400, "style must be motion or blurfill")
+        width = max(160, min(width, 1280)) // 2 * 2
+        height = round(width * r.height / max(r.width, 1)) // 2 * 2
+        look = {k: getattr(r, k) for k in Look.__dataclass_fields__}
+        if background:
+            look["background"] = background
+        if layout:
+            look["layout"] = layout
+        key = (name, style, json.dumps(look, sort_keys=True), width, height)
+        if key in look_cache:
+            return Response(look_cache[key], media_type="image/jpeg", headers={"Cache-Control": "max-age=60"})
+        panels = _preview_panels(p)
+        if not panels:
+            raise HTTPException(404, "no pages yet")
+        infos = {f"x{i}": PanelInfo(path, w, h) for i, (path, w, h) in enumerate(panels)}
+        ids = list(infos)
+        # motion: two side-by-side-friendly panels; blurfill: one
+        pick = [i for i in ids if 0.6 <= infos[i].w / max(infos[i].h, 1) <= 2.4][:2] or ids[:2]
+        shown = pick if style == "motion" and len(pick) == 2 else pick[:1]
+        try:
+            st = make_style(style, width, height, infos, Look.from_dict(look))
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        frame = st.frame(Shot(0.0, 4.0, shown, "normal", 1), None, 3.9)
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 84])
+        if not ok:
+            raise HTTPException(500, "could not encode the preview")
+        if len(look_cache) > 64:
+            look_cache.clear()
+        look_cache[key] = buf.tobytes()
+        return Response(look_cache[key], media_type="image/jpeg", headers={"Cache-Control": "max-age=60"})
+
     def chapter_index(p: Path, cfg: Config) -> dict:
         """Chapters in pipeline order (the numbers --chapters uses), with their processing status."""
         from ..books import extract, is_book_project
@@ -536,6 +643,22 @@ def create_app(library: Path) -> FastAPI:
         except Exception as e:  # noqa: BLE001 - an estimate must never break the page
             est = {"error": str(e)[:200]}
         return {"runs": runs, "estimate": est, "is_book": is_book}
+
+    @app.get("/api/projects/{name}/estimate")
+    def estimate(name: str, chapters: str | None = None):
+        """Estimate of the next run for a chapter selection (the Make tab's picker), without the run history."""
+        from .. import usage
+        from ..books import is_book_project
+
+        if chapters and not re.match(r"^\s*\d+(\s*-\s*\d*)?(\s*,\s*\d+(\s*-\s*\d*)?)*\s*$", chapters):
+            raise HTTPException(400, "chapters must look like 1-5,8")
+        p = project_dir(name)
+        cfg = Config.load(p, {"chapters": chapters} if chapters else {})
+        is_book = cfg.source == "book" or (cfg.source == "auto" and is_book_project(p))
+        try:
+            return usage.estimate(p, cfg, scan_chapters(p), is_book)
+        except Exception as e:  # noqa: BLE001
+            return {"error": str(e)[:200]}
 
     @app.get("/api/projects/{name}/script")
     def get_script(name: str):
@@ -815,6 +938,15 @@ def create_app(library: Path) -> FastAPI:
     @app.exception_handler(HTTPException)
     async def http_error(_, exc: HTTPException):
         return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+
+    @app.middleware("http")
+    async def no_stale_ui(request, call_next):
+        """The UI files change with every update: make the browser revalidate them (cheap 304s) instead of
+        running an old app.js against a new server."""
+        response = await call_next(request)
+        if not request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
     app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")
     return app

@@ -151,7 +151,7 @@ class Project:
         key = self._selection_key()
         # hook/outro only affect assembly: they must not invalidate the (expensive) chapter scripts
         assembly = key + hashlib.sha1(
-            json.dumps([self.cfg.hook, self.cfg.hook_words, self.cfg.outro, self.cfg.image_sources, asdict(self.cfg.images), self.cfg.polish]).encode()
+            json.dumps([self.cfg.hook, self.cfg.hook_words, self.cfg.outro, self.cfg.image_sources, asdict(self.cfg.images), self.cfg.polish] + ([self.cfg.polisher] if self.cfg.polisher else [])).encode()
         ).hexdigest()[:6]
         if script_path.exists():
             existing = json.loads(script_path.read_text("utf-8"))
@@ -162,7 +162,9 @@ class Project:
 
         reader = make_chain(self.cfg.reader, "reader", need_vision=True)
         writer = make_chain(self.cfg.writer, "writer", need_vision=False)
-        for chain in (reader, writer):
+        # the polish pass can use its own (stronger) model: local writers draft, a better model line-edits
+        self.polisher = make_chain(self.cfg.polisher, "polisher", need_vision=False) if self.cfg.polisher else writer
+        for chain in (reader, writer, *([self.polisher] if self.polisher is not writer else [])):
             for p in chain.providers:
                 try:
                     p.check()
@@ -182,7 +184,7 @@ class Project:
                 return {}
             hook, chapters_out = res
         if self.cfg.polish and self.source == "book":  # manga/manhwa chapters are polished as they are written
-            hook, chapters_out = self._polish(hook, chapters_out, writer)
+            hook, chapters_out = self._polish(hook, chapters_out, self.polisher)
         if self.cfg.outro.strip() and chapters_out and chapters_out[-1]["beats"]:
             last = chapters_out[-1]["beats"][-1]
             chapters_out[-1]["beats"] = [*chapters_out[-1]["beats"], {"text": self.cfg.outro.strip(), "panels": last["panels"][-1:], "emphasis": "normal"}]
@@ -197,7 +199,7 @@ class Project:
         script_path.write_text(json.dumps(script, ensure_ascii=False, indent=1), "utf-8")
         words = sum(len(b["text"].split()) for c in [{"beats": hook}, *chapters_out] for b in c["beats"])
         console.print(
-            f"script: {script_path}  ({words} words, ~{words / self.cfg.words_per_minute:.0f} min) - "
+            f"script: {script_path}  ({words} words, ~{words / self._pace():.0f} min) - "
             "edit it freely, then re-run to voice/render the changes"
         )
         return script
@@ -262,7 +264,7 @@ class Project:
         from .story import polish_chapter
 
         def polished(beats: list[dict], title: str) -> list[dict]:
-            return polish_chapter(beats, title, bible, writer, self.cfg, script_dir) if self.cfg.polish else beats
+            return polish_chapter(beats, title, bible, self.polisher, self.cfg, script_dir) if self.cfg.polish else beats
 
         def hook_job() -> list[dict]:
             return polished(write_hook(all_notes, bible, writer, self.cfg, script_dir / f"hook_{key}_{self.cfg.hook_words}.json"), "Intro")
@@ -352,6 +354,11 @@ class Project:
         buf = buf[: int(total * sr)]
         narration = self.work / name
         sf.write(str(narration), buf, sr)
+        words = sum(len(b["text"].split()) for b in all_beats)
+        if words >= 300:  # the real pace (voice + pauses) makes later length estimates honest
+            from . import usage
+
+            usage.save_pace(self.work, tcfg, words, total)
         console.print(f"narration: {total / 60:.1f} min")
         return timed, narration, markers
 
@@ -452,9 +459,14 @@ class Project:
             outs.append(self.stage_render(timed, narration, markers, base.with_name(f"{base.stem}{suffix}{base.suffix}")))
         return outs
 
+    def _pace(self) -> float:
+        from . import usage
+
+        return usage.pace(self.work, self.cfg)
+
     def preview_script(self, script: dict, seconds: float = 60.0) -> dict:
         """The opening ~minute: the hook plus the first beats, enough to judge look, voice and pacing."""
-        budget = seconds * self.cfg.words_per_minute / 60
+        budget = seconds * self._pace() / 60
         used = sum(len(b["text"].split()) for b in script.get("hook", []))
         chapters = []
         for c in script["chapters"]:
@@ -484,7 +496,7 @@ class Project:
 
     def parts(self, script: dict) -> list[dict]:
         """Split into parts of about episode_minutes (whole chapters only). Parts 2+ open with 'previously on'."""
-        mins, wpm = self.cfg.episode_minutes, self.cfg.words_per_minute
+        mins, wpm = self.cfg.episode_minutes, self._pace()
         chapters = script["chapters"]
 
         def minutes(beats: list[dict]) -> float:

@@ -236,3 +236,86 @@ video { width: 100%; border-radius: 10px; background: #000; max-height: 70vh; }
 .vbook p { margin: 0 0 1em; }
 .vimgs { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
 .vimgs img { max-height: 320px; max-width: 100%; border-radius: 6px; }
+
+/* make video studio: steps on the left, a sticky summary with the start buttons on the right */
+.studio { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 18px; align-items: start; }
+.studio > aside { position: sticky; top: 76px; }
+.step { display: flex; flex-direction: column; gap: 12px; }
+.stephead { display: flex; align-items: center; gap: 10px; }
+.stephead h2 { margin: 0; }
+.stepn { display: inline-grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; flex: none; font-size: 12px; font-weight: 700;
+  color: #fff; background: linear-gradient(135deg, var(--accent), #ff5ca8); }
+.grid2s { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px 18px; }
+.grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px 18px; }
+.segs { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.seg { flex-direction: column; align-items: flex-start; gap: 0; background: var(--bg2); }
+.seg span { font-weight: 400; font-size: 11.5px; color: var(--muted); }
+.seg.small { flex-direction: row; padding: 5px 12px; font-size: 12.5px; }
+.seg.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, var(--bg2)); }
+.stylecards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.stylecard { display: flex; flex-direction: column; align-items: stretch; gap: 0; padding: 0; overflow: hidden; background: var(--bg2); white-space: normal; text-align: left; }
+.stylecard img, .stylecard .lookph { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block; background: var(--panel2); }
+.stylecard .lookph { display: grid; place-items: center; color: var(--faint); font-weight: 500; font-size: 12px; padding: 8px; text-align: center; }
+.stylecard .sctext { display: flex; flex-direction: column; padding: 8px 10px 10px; }
+.stylecard.on { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent); }
+.swatch { padding: 4px 10px 4px 5px; font-size: 12px; font-weight: 500; background: var(--bg2); }
+.swatch i { width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--line); display: inline-block; }
+.swatch.on { border-color: var(--accent); }
+details.fine { margin-top: 8px; }
+details.fine > summary, details.adv > summary { cursor: pointer; color: var(--muted); font-weight: 600; }
+details.adv[open] > summary { color: var(--text); }
+.summary { display: flex; flex-direction: column; gap: 10px; }
+.summary h2 { margin: 0; }
+.summary hr { border: none; border-top: 1px solid var(--line); margin: 2px 0; width: 100%; }
+.sumrows { display: flex; flex-direction: column; gap: 5px; }
+.sumrow { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; }
+.sumrow span:last-child { text-align: right; overflow: hidden; text-overflow: ellipsis; }
+.bigest { font-size: 22px; font-weight: 750; color: var(--text); }
+button.big { justify-content: center; padding: 12px 16px; font-size: 15px; }
+button.wide { justify-content: center; }
+.latest { display: flex; gap: 10px; align-items: center; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); }
+.latest > span { font-size: 18px; color: var(--accent2); }
+.latest b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 230px; font-size: 12.5px; }
+.latest:hover { border-color: var(--accent); text-decoration: none; }
+.jobcard { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.jobslot:empty { display: none; }
+.logbox > summary { cursor: pointer; color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.videoready { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 16px; align-items: center; }
+.vpick { display: flex; flex-direction: column; gap: 6px; }
+.vrow { display: flex; gap: 6px; }
+.vrow select { flex: 1; min-width: 0; }
+.vplay { flex: none; width: 40px; justify-content: center; padding: 0; }
+.vplay.playing { border-color: var(--accent); color: var(--accent2); }
+.warntext { color: var(--warn); }
+
+/* options: essentials / all, search, section links */
+.optbar { position: sticky; top: 61px; z-index: 10; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 12px; margin-bottom: 14px;
+  background: color-mix(in srgb, var(--panel) 92%, transparent); backdrop-filter: blur(8px); border: 1px solid var(--line); border-radius: var(--radius); }
+.optnav { display: flex; gap: 2px; flex-wrap: wrap; }
+.optnav a { padding: 3px 8px; border-radius: 7px; color: var(--muted); font-size: 12.5px; font-weight: 600; }
+.optnav a:hover { background: var(--panel2); color: var(--text); text-decoration: none; }
+.optgroup { scroll-margin-top: 130px; }
+
+/* library */
+.pcard .cover .cprog { position: absolute; left: 0; right: 0; bottom: 0; padding: 8px 10px; color: #fff; font-size: 12px; font-weight: 600;
+  background: linear-gradient(transparent, rgba(0, 0, 0, .8)); }
+.pcard .cover .cprog .bar { background: rgba(255, 255, 255, .25); margin-top: 4px; }
+.onboard { text-align: center; padding: 36px 24px; }
+.steps3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 18px; margin: 22px 0; text-align: left; }
+.steps3 > div { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+.steps3 b { display: block; margin: 8px 0 2px; }
+
+@media (max-width: 980px) {
+  .studio { grid-template-columns: 1fr; }
+  .studio > aside { position: static; order: -1; }
+  .videoready { grid-template-columns: 1fr; }
+}
+@media (max-width: 640px) {
+  .stylecards { grid-template-columns: 1fr; }
+  .optbar { position: static; }
+}
+@media (max-width: 760px) {
+  .brand > span:not(.logo) { display: none; }
+  .topbar nav { min-width: 0; overflow-x: auto; }
+  .phead { flex-wrap: wrap; }
+}

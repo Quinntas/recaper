@@ -131,7 +131,16 @@ def read_chapter(
             parts.extend(ImagePart(t) for t in _read_tiles(panel, work_dir))
         console.print(f"  reading {chapter.cid} batch {bi}/{len(batches)} ({len(batch)} panels)")
         res = reader.complete_json(prompts.READER_SYSTEM, parts)
+        if isinstance(res, list):
+            if res and isinstance(res[0], dict) and "panels" in res[0]:
+                res = res[0]
+            else:
+                res = {"panels": [x for x in res if isinstance(x, dict)]}
+        elif not isinstance(res, dict):
+            res = {}
         for entry in res.get("panels", []):
+            if not isinstance(entry, dict):
+                continue
             label = _norm_label(entry.get("id"))
             if label in labels:
                 panel_notes[label] = {
@@ -187,6 +196,10 @@ def reconcile_bible(all_notes: list[dict], writer: Chain, work_dir: Path) -> Bib
         )
         try:
             res = writer.complete_json(prompts.BIBLE_SYSTEM, [listing])
+            if isinstance(res, list):
+                res = res[0] if (res and isinstance(res[0], dict)) else {}
+            elif not isinstance(res, dict):
+                res = {}
             merged = Bible()
             merged.merge(res.get("characters"), res.get("terms"))
             for term, meaning in naive.terms.items():
@@ -419,7 +432,10 @@ def polish_chapter(beats: list[dict], title: str, bible: Bible, writer: Chain, c
     """Line-edit one chapter's beat texts (panels, emphasis and count untouched). Cached by content."""
     if len(beats) < 2:
         return beats
-    blob = json.dumps([[b["text"] for b in beats], cfg.lang, cfg.extra_instructions, bible.text(), prompts.POLISH_SYSTEM], ensure_ascii=False)
+    parts = [[b["text"] for b in beats], cfg.lang, cfg.extra_instructions, bible.text(), prompts.POLISH_SYSTEM]
+    if cfg.polisher:  # a different editor model = a different edit (the writer's own polish stays cached)
+        parts.append(cfg.polisher)
+    blob = json.dumps(parts, ensure_ascii=False)
     path = cache_dir / f"polish_{hashlib.sha1(blob.encode()).hexdigest()[:16]}.json"
     if path.exists():
         texts = json.loads(path.read_text("utf-8"))["texts"]

@@ -20,22 +20,38 @@ uv run recaper ui                    # opens http://127.0.0.1:8765, projects liv
 uv run recaper ui -L D:\recaps       # any library folder (one sub-folder per series)
 ```
 
-- **Library**: every project with its cover, chapter count, and video/working badges.
+- **Library**: every project with its cover and status (videos / script ready / not started), newest first,
+  with live progress on the cover while a video is being made, and a search box once the library grows.
 - **Download**: search a source, pick a language, select chapters (all / range / not downloaded, per-chapter
   scanlation group, preferred group), choose the project folder and image quality. You can **make the video
   automatically when the download finishes**. Re-downloading skips chapters already on disk.
-- **Project → Make video**: pick the **chapters** to make the video from (tick, shift-click a range, or type
-  `1-5,8`; cached chapters show as read / script), stop after any stage, redo stages, panel previews, output
-  name, quick preview, a live progress bar per stage, a streaming log, and Stop (kills the whole run, including
-  render/voice workers). A chapter subset is saved as `<title>_ch1-5_recap.mp4`, so it never overwrites the full
-  video.
+- **Project → Make video** walks through four steps, with a summary and the start buttons beside them:
+  1. **Chapters**: all by default; "Choose chapters…" opens the list (tick, shift-click a range, or type
+     `1-5,8`; cached chapters show as read / script). A subset is saved as `<title>_ch1-5_recap.mp4`, so it
+     never overwrites the full video.
+  2. **Look**: Auto / Motion / Blur-fill as cards **previewed with a real frame made from the project's own
+     panels**, background swatches and resolution (1080p, 720p, 4K, vertical Shorts…).
+  3. **Narration**: language, voice (the selected engine's voices, narration-language voices first) with a
+     **▶ sample** at the chosen speed, and speed.
+  4. **Length**: Short / Standard / Detailed per chapter, and splitting long recaps into parts.
+
+  These quick settings save straight into the project's options. The summary shows the estimated video length
+  (calibrated on the project's last narration) and the model calls left to make. **⚡ Quick preview** renders the
+  first ~60 s at 480p; **▶ Make video** the whole thing. Stop-after, redo stages, output name and contact sheets
+  are under *Advanced*. While it runs: a progress bar per stage, a collapsible log, Stop (kills the whole run,
+  including render/voice workers), the progress in the tab title, and a desktop notification when it finishes
+  in the background. When it is done the video plays right there, with Download.
+- **Queue**: video runs are queued and run one at a time (each one already uses the whole GPU, CPU and model
+  quota); the job shows its place in the queue. Downloads always start right away and run in parallel.
 - **Chapter viewer** (👁 in the Make and Chapters tabs): read any chapter in the browser, as a webtoon strip or
   page by page (← → or click the page edges, Esc closes). Books show the chapter text with its illustrations.
 - **Settings**: general options for **every project** (models, language, voice, look, image generator…),
   saved to `~/.recaper.toml`. Per-series options (title, chapters, image sources) stay on the project.
 - **Project → Options**: *every* setting (generated from the config, so none are missing), with help text.
-  Empty fields show what is inherited (global Settings, else the default). Saved to the project's
-  `recaper.toml`, the same file the CLI reads.
+  **Essentials** shows the ~20 that matter most (plus anything set here), **All options** the rest; a search box
+  and section links find the others. Empty fields show what is inherited (global Settings, else the default).
+  Leaving with unsaved changes asks first. Saved to the project's `recaper.toml`, the same file the CLI reads.
+  The same editor runs the global Settings page.
 - **Deleting**: the 🗑 on a library card or the project page deletes the whole project, or only its cache
   (re-cut / re-read / re-voice next run) or its videos. Single chapters (Chapters tab) and videos (Videos tab)
   can be deleted too. A running job is stopped first, and a deleted project is unlinked from projects that
@@ -124,12 +140,13 @@ Existing environment variables take precedence.
 Everything is in the UI's Options tab (and `recaper.toml`). Beyond story, models, voice and video:
 
 - **Look & motion:** background for the motion style (`paper`, `black`, `white`, `dark`, `blur` = blurred
-  current panel, or any `#rrggbb`), multi-panel layout (cascade / row), panel reveal (progressive /
+  current panel, or any `#rrggbb`), multi-panel layout (clean = at most two panels, never overlapping / cascade / row), panel reveal (progressive /
   together), card border, shadow strength, camera motion, hit effect, animation speed, frame fill, max
   upscale, background blur and brightness.
 - **Story:** cold-open hook on/off, hook length, and a closing line voiced over the last panel.
-- **Polish pass** (`polish`, on by default): after writing, one extra writer call per chapter line-edits the
-  script. A local checker first lists what to fix: speech reported in the present ("he tells her"), sentences
+- **Polish pass** (`polish`, on by default): after writing, one extra call per chapter line-edits the
+  script, by the writer or by a separate **polisher** model (`polisher`, CLI `--polisher claude:sonnet`): a
+  local writer drafts, a stronger model edits. Its calls show on their own row of the usage estimate. A local checker first lists what to fix: speech reported in the present ("he tells her"), sentences
   that keep opening with the same word, repeated phrases, too few "but / however" turns, sentences over 35
   words, more than one rhetorical question. The model also checks names against the story bible. Panels,
   emphasis and beat count never change, and a rewritten line that lost or invented too much is ignored.
@@ -195,7 +212,7 @@ uv run recaper doctor --live
 
 ## Models
 
-`--reader` must see images; `--writer` only needs text. Each takes a comma-separated **fallback chain**: if a provider hits a usage cap it is skipped for the rest of the run.
+`--reader` must see images; `--writer` and `--polisher` (the polish pass, default: the writer) only need text. Each takes a comma-separated **fallback chain**: if a provider hits a usage cap it is skipped for the rest of the run.
 
 | Spec | Auth | Vision |
 |---|---|---|
@@ -216,11 +233,11 @@ recaper run ./series --reader claude --writer deepseek-free,claude
 
 ```
 --lang pt                 narration language (script + voice), default en
---style motion|blurfill   motion = panel cards on paper, revealed in sync with the narration, cascading (manga default)
+--style motion|blurfill   motion = panel cards on paper, revealed in sync with the narration, at most two at a time (manga default)
                           blurfill = panel over blurred copy, Ken Burns (manhwa default)
 --mpc 2.5                 narration minutes per chapter   |  --minutes 90  total length target
 --chapters 1-20           chapter selection
---tts kokoro --voice am_michael --speed 1.2   (1.2 ≈ 200 wpm, close to top recap channels)
+--tts kokoro --voice am_michael --speed 1.0   (default; 1.0 ≈ 170 wpm, 1.2 ≈ 200 wpm like fast recap channels)
 --extra "Call the MC 'Jinwoo'. Hype tone."   extra writer directions
 --until panels|read|script|voice|render      stop early (e.g. review script.json)
 --force script            redo a stage (repeatable)

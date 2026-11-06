@@ -26,6 +26,7 @@ def run(
     reading: Optional[str] = typer.Option(None, help="Manga panel order: auto | rtl | ltr"),
     reader: Optional[str] = typer.Option(None, help="Vision model(s) that read panels, e.g. 'claude:sonnet,gemini'"),
     writer: Optional[str] = typer.Option(None, help="Model(s) that write the script, e.g. 'deepseek-free,claude:sonnet'"),
+    polisher: Optional[str] = typer.Option(None, help="Model(s) for the polish pass (default: the writer), e.g. 'claude:sonnet'"),
     tts: Optional[str] = typer.Option(None, "--tts", help="RealtimeTTS engine: kokoro | edge | coqui | openai | elevenlabs | system ..."),
     voice: Optional[str] = typer.Option(None, help="Voice name for the TTS engine (default depends on engine + language)"),
     speed: Optional[float] = typer.Option(None, help="Speech speed multiplier"),
@@ -39,6 +40,7 @@ def run(
     encoder: Optional[str] = typer.Option(None, help="auto | nvenc | x264"),
     workers: Optional[int] = typer.Option(None, help="Parallel render workers (default: auto)"),
     jobs: Optional[int] = typer.Option(None, "--jobs", "-j", help="Parallel model calls for reading/writing (default 6)"),
+    read_batch: Optional[int] = typer.Option(None, "--read-batch", help="Max panels per reader call (default 36; recommend 8-12 for Ollama)"),
     out: Optional[Path] = typer.Option(None, "--out", "-o", help="Output .mp4 path"),
     until: str = typer.Option("render", help="Stop after stage: panels | read | script | voice | render"),
     force: list[str] = typer.Option([], "--force", "-f", help="Redo a stage (repeatable): panels | read | script | voice | render"),
@@ -55,12 +57,14 @@ def run(
         "reading": reading,
         "reader": reader,
         "writer": writer,
+        "polisher": polisher,
         "minutes_per_chapter": minutes_per_chapter,
         "target_minutes": target_minutes,
         "chapters": chapters,
         "title": title,
         "extra_instructions": extra,
         "jobs": jobs,
+        "read_batch": read_batch,
         "tts.engine": tts,
         "tts.voice": voice,
         "tts.speed": speed,
@@ -80,7 +84,7 @@ def run(
     project = Project(folder, cfg)
     from . import usage
 
-    usage.start(project.work, until=until, quick=quick, force=force, reader=cfg.reader, writer=cfg.writer,
+    usage.start(project.work, until=until, quick=quick, force=force, reader=cfg.reader, writer=cfg.writer, polisher=cfg.polisher or None,
                 generator=cfg.images.generator, tts=cfg.tts.engine)  # fmt: skip
     outputs: list[Path] = []
     try:
@@ -212,9 +216,10 @@ def download(
     result = do_download(con, manga, picked, dest, quality=quality, progress=prog)
     console.print(f"[green]downloaded {len(result['downloaded'])}[/], existing {len(result['skipped_existing'])}, failed {len(result['failed'])} -> {dest}")
     if make_video:
-        run(folder=dest, lang=None, style=None, source=None, reading=None, reader=None, writer=None, tts=None, voice=None,
+        run(folder=dest, lang=None, style=None, source=None, reading=None, reader=None, writer=None, polisher=None, tts=None, voice=None,
             speed=None, minutes_per_chapter=None, target_minutes=None, chapters=None, title=None, extra=None, fps=None,
-            resolution=None, encoder=None, workers=None, jobs=None, out=None, until="render", force=[], preview=False)
+            resolution=None, encoder=None, workers=None, jobs=None, read_batch=None, out=None, until="render", force=[], preview=False,
+            quick=False, parts=None)
 
 
 def pick_chapters(all_ch, spec: Optional[str], group: Optional[str]):

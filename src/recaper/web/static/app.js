@@ -51,6 +51,7 @@ function toast(msg, kind = '') {
 }
 function fmtBytes(n) { return n > 1e9 ? (n / 1e9).toFixed(2) + ' GB' : (n / 1e6).toFixed(1) + ' MB'; }
 function fmtDate(t) { return new Date(t * 1000).toLocaleString(); }
+function fmtMin(m) { m = Math.round(m); return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`; }
 function fmtDur(s) { s = Math.max(0, Math.round(s)); return s >= 3600 ? `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m` : s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`; }
 function statusChip(status) {
   const cls = { done: 'ok', failed: 'bad', cancelled: 'warn', running: 'accent', queued: '' }[status] || '';
@@ -80,7 +81,14 @@ function bar(frac, big = false) { return h('div', { class: `bar ${big ? 'big' : 
 
 // ------------------------------------------------------------------ router
 let renderSeq = 0;
+let currentHash = location.hash;
 async function render() {
+  // unsaved options: ask before leaving (hashchange can't be cancelled, so step back to where we were)
+  if (STATE.leaveGuard && location.hash !== currentHash) {
+    if (!STATE.leaveGuard()) { history.replaceState(null, '', currentHash || '#/'); return; }
+  }
+  STATE.leaveGuard = null;
+  currentHash = location.hash;
   clearPollers();
   const seq = ++renderSeq;
   const { parts, q } = route();
@@ -114,29 +122,59 @@ window.addEventListener('hashchange', render);
 // ------------------------------------------------------------------ library
 async function viewLibrary() {
   const [projects, state] = await Promise.all([api('/api/projects'), api('/api/state')]);
+  projects.sort((a, b) => (b.modified || 0) - (a.modified || 0));
+  const progress = new Map();  // project -> {el, label, bar}
+  const cards = projects.map((p) => projectCard(p, progress));
   const grid = h('div', { class: 'cards' },
     h('button', { class: 'newcard', onclick: newProjectModal }, h('div', {}, h('div', { style: { fontSize: '30px' } }, '+'), 'New project')),
-    projects.map(projectCard));
+    cards);
+  const search = h('input', { type: 'search', placeholder: `Search ${projects.length} projects…`, style: { maxWidth: '260px' }, oninput: () => {
+    const q = search.value.trim().toLowerCase();
+    cards.forEach((c, i) => { c.hidden = !!q && !projects[i].name.toLowerCase().includes(q); });
+  } });
+  // live progress of running / queued videos on the covers
+  const live = async () => {
+    let jobs;
+    try { jobs = await api('/api/jobs'); } catch { return; }
+    for (const [name, slot] of progress) {
+      const j = jobs.find((x) => x.project === name && ['running', 'queued'].includes(x.status));
+      slot.el.hidden = !j;
+      if (!j) continue;
+      slot.label.textContent = j.status === 'queued' ? `Queued${j.position ? ` #${j.position}` : ''}` : `${(STAGES.find(([id]) => id === j.current) || [, 'Working'])[1]} · ${Math.round(j.progress * 100)}%`;
+      slot.bar.style.width = `${Math.round(j.progress * 100)}%`;
+    }
+  };
+  if (projects.some((p) => p.active_job)) { live(); every(2000, live); }
   return h('div', {},
     h('div', { class: 'row', style: { marginBottom: '18px' } },
       h('div', {}, h('h1', {}, 'Library'), h('div', { class: 'muted small' }, `${projects.length} project(s) in ${state.library}`)),
       h('div', { class: 'spacer' }),
+      projects.length > 3 ? search : null,
       h('a', { class: 'btn', href: '#/discover' }, '⬇ Download manga'),
       h('button', { class: 'primary', onclick: newProjectModal }, '+ New project')),
-    projects.length ? grid : h('div', { class: 'card empty' },
-      h('h2', {}, 'No projects yet'),
-      h('p', {}, 'Download chapters from a source, or create a project and drop your own chapter folders, .cbz or .pdf files into it.'),
+    projects.length ? grid : h('div', { class: 'card onboard' },
+      h('h2', {}, 'Turn a manga, manhwa or light novel into a narrated recap video'),
+      h('div', { class: 'steps3' },
+        h('div', {}, h('span', { class: 'stepn' }, 1), h('b', {}, 'Add a series'), h('p', { class: 'muted small' }, 'Download chapters from a source, or create a project and drop chapter folders, .cbz, .pdf or .epub files in.')),
+        h('div', {}, h('span', { class: 'stepn' }, 2), h('b', {}, 'Pick a look and a voice'), h('p', { class: 'muted small' }, 'Preview the style on your own panels and listen to voices before anything runs.')),
+        h('div', {}, h('span', { class: 'stepn' }, 3), h('b', {}, 'Make the video'), h('p', { class: 'muted small' }, 'AI reads the panels, writes and voices the narration, and renders a 1080p video with YouTube chapters.'))),
       h('div', { class: 'row', style: { justifyContent: 'center' } },
         h('a', { class: 'btn primary', href: '#/discover' }, '⬇ Download manga'),
         h('button', { onclick: newProjectModal }, '+ New project'))));
 }
-function projectCard(p) {
+function projectCard(p, progress) {
+  const label = h('span', {});
+  const fill = h('i', {});
+  const prog = h('div', { class: 'cprog', hidden: !p.active_job }, label, h('div', { class: 'bar' }, fill));
+  if (progress) progress.set(p.name, { el: prog, label, bar: fill });
+  const status = p.videos.length ? h('span', { class: 'chip ok' }, `▶ ${p.videos.length} video${p.videos.length > 1 ? 's' : ''}`)
+    : p.has_script ? h('span', { class: 'chip accent' }, 'script ready') : h('span', { class: 'chip' }, 'not started');
   const cover = h('div', { class: 'cover', style: { backgroundImage: `url("/api/projects/${enc(p.name)}/cover"), linear-gradient(135deg, #2a2440, #1a1d24)` } },
     h('div', { class: 'over' },
-      p.active_job ? h('span', { class: 'chip accent' }, '● working') : null,
-      p.videos.length ? h('span', { class: 'chip ok' }, '▶ video') : null,
+      status,
       h('div', { class: 'spacer' }),
-      h('button', { class: 'small ghost cardx', title: 'Delete…', onclick: (e) => { e.preventDefault(); e.stopPropagation(); deleteProjectModal(p.name, render); } }, '🗑')));
+      h('button', { class: 'small ghost cardx', title: 'Delete…', onclick: (e) => { e.preventDefault(); e.stopPropagation(); deleteProjectModal(p.name, render); } }, '🗑')),
+    prog);
   return h('a', { class: 'pcard', href: `#/p/${enc(p.name)}` }, cover,
     h('div', { class: 'meta' },
       h('div', { class: 'title' }, p.name),
@@ -397,7 +435,9 @@ function stagesView(job) {
   }
   const order = STAGES.map((s) => s[0]);
   const curIdx = order.indexOf(job.current);
-  wrap.append(h('div', { class: 'row' }, h('strong', {}, job.title), statusChip(job.status), h('div', { class: 'spacer' }),
+  wrap.append(h('div', { class: 'row' }, h('strong', {}, job.title), statusChip(job.status),
+    job.status === 'queued' && job.position ? h('span', { class: 'muted small' }, job.position === 1 ? 'next - starts when the current video finishes' : `#${job.position} in the queue`) : null,
+    h('div', { class: 'spacer' }),
     job.started ? h('span', { class: 'muted small' }, fmtDur((job.finished || Date.now() / 1000) - job.started)) : null,
     h('span', { class: 'muted small' }, `${Math.round(job.progress * 100)}%`)));
   wrap.append(bar(job.progress, true));
@@ -413,10 +453,12 @@ function stagesView(job) {
 function watchJob(jobId, container, { project, onDone, showLog = true } = {}) {
   let since = 0;
   const top = h('div', {});
-  const log = h('div', { class: 'log mono', hidden: !showLog });
+  const result = h('div', {});
+  const log = h('div', { class: 'log mono' });
+  const logBox = h('details', { class: 'logbox', open: showLog }, h('summary', {}, 'Log'), log);
   const actions = h('div', { class: 'row' });
   container.innerHTML = '';
-  container.append(h('div', { class: 'card', style: { marginTop: '16px' } }, h('div', { class: 'stack' }, top, actions, log)));
+  container.append(h('div', { class: 'card jobcard' }, h('div', { class: 'stack' }, top, result, actions, logBox)));
   let finished = false;
   const tick = async () => {
     let job;
@@ -429,27 +471,46 @@ function watchJob(jobId, container, { project, onDone, showLog = true } = {}) {
       log.append(job.log.join('\n') + '\n');
       if (atBottom) log.scrollTop = log.scrollHeight;
     }
+    const pageTitle = STATE.page ? STATE.page.title : 'recaper';
+    document.title = job.status === 'running' ? `${Math.round(job.progress * 100)}% · ${pageTitle} · recaper` : `${pageTitle} · recaper`;
     actions.innerHTML = '';
     if (job.status === 'running' || job.status === 'queued') {
       actions.append(h('button', { class: 'danger small', onclick: async () => { await api(`/api/jobs/${jobId}/cancel`, { method: 'POST' }); toast('Cancelling…'); } }, '■ Stop'));
-    } else {
-      if (job.error && job.status === 'failed') actions.append(h('span', { class: 'chip bad' }, job.error.slice(0, 220)));
-      if (project) actions.append(h('a', { class: 'btn small', href: `#/p/${enc(project)}` }, 'Open project →'));
-      if (job.result && job.result.output) actions.append(h('a', { class: 'btn small primary', href: `#/p/${enc(project || job.project)}?tab=videos` }, '▶ Watch video'));
-      if (!finished) {
-        finished = true;
-        toast(`${job.title}: ${job.status}`, job.status === 'done' ? 'ok' : 'bad');
-        // a download may have chained a pipeline job
-        if (job.kind === 'download' && job.status === 'done') {
-          setTimeout(async () => {
-            const all = await api('/api/jobs');
-            const next = all.find((j) => j.project === job.project && j.kind === 'pipeline' && ['running', 'queued'].includes(j.status));
-            if (next) watchJob(next.id, container, { project: job.project, onDone });
-          }, 800);
-        }
-        onDone && onDone(job);
-      }
+      return;
     }
+    if (job.error && job.status === 'failed') actions.append(h('span', { class: 'chip bad' }, job.error.slice(0, 220)));
+    const proj = project || job.project;
+    if (finished) return;
+    finished = true;
+    const outs = (job.result && (job.result.outputs || (job.result.output ? [job.result.output] : []))) || [];
+    if (job.status === 'done' && outs.length) {
+      const file = String(outs[0]).split(/[\\/]/).pop();
+      const url = `/api/projects/${enc(proj)}/file/${enc(file)}`;
+      result.append(h('div', { class: 'videoready' },
+        h('video', { src: url, controls: true, preload: 'metadata' }),
+        h('div', { class: 'stack', style: { gap: '8px' } },
+          h('h2', { style: { margin: 0 } }, '✓ Your video is ready'),
+          h('div', { class: 'muted small' }, file, outs.length > 1 ? ` (+${outs.length - 1} more part${outs.length > 2 ? 's' : ''})` : ''),
+          h('div', { class: 'row' },
+            h('a', { class: 'btn primary', href: url, download: file }, '⬇ Download'),
+            h('a', { class: 'btn', href: `#/p/${enc(proj)}?tab=videos` }, 'All videos & YouTube chapters'),
+            h('a', { class: 'btn', href: `#/p/${enc(proj)}?tab=script` }, 'Edit script')))));
+      logBox.open = false;
+    } else if (job.status === 'failed') {
+      logBox.open = true;
+    }
+    if (!project) actions.append(h('a', { class: 'btn small', href: `#/p/${enc(proj)}` }, 'Open project →'));
+    toast(`${job.title}: ${job.status}`, job.status === 'done' ? 'ok' : 'bad');
+    notify(`recaper · ${job.status === 'done' ? 'video ready' : job.status}`, `${proj}: ${job.title}`);
+    // a download may have chained a pipeline job
+    if (job.kind === 'download' && job.status === 'done') {
+      setTimeout(async () => {
+        const all = await api('/api/jobs');
+        const next = all.find((j) => j.project === job.project && j.kind === 'pipeline' && ['running', 'queued'].includes(j.status));
+        if (next) watchJob(next.id, container, { project: job.project, onDone });
+      }, 800);
+    }
+    onDone && onDone(job);
   };
   tick();
   every(1000, () => { if (!finished) tick(); });
@@ -486,8 +547,9 @@ setInterval(refreshBadge, 3000);
 async function viewProject(name, tab) {
   const page = STATE.page;
   const p = await api(`/api/projects/${enc(name)}`);
-  const tabs = [['make', 'Make video'], ['options', 'Options'], ['script', 'Script'], ['videos', `Videos${p.videos.length ? ` (${p.videos.length})` : ''}`], ['chapters', `Chapters (${p.chapters})`], ['images', 'Images'], ['panels', 'Panels'], ['usage', 'Usage']];
-  const tabLabel = { make: 'Make video', options: 'Options', script: 'Script', videos: 'Videos', chapters: 'Chapters', images: 'Images', panels: 'Panels' }[tab] || 'Make video';
+  const tabs = [['make', 'Make video'], ['videos', `Videos${p.videos.length ? ` (${p.videos.length})` : ''}`], ['script', 'Script'], ['chapters', `Chapters (${p.chapters})`],
+    ['options', 'Options'], ['images', 'Images'], ['panels', 'Panels'], ['usage', 'Usage']];
+  const tabLabel = { make: 'Make video', options: 'Options', script: 'Script', videos: 'Videos', chapters: 'Chapters', images: 'Images', panels: 'Panels', usage: 'Usage' }[tab] || 'Make video';
   page.title = `${p.name} · ${tabLabel}`;
   const body = h('div', {});
   const view = h('div', {},
@@ -503,9 +565,10 @@ async function viewProject(name, tab) {
           p.videos.length ? h('span', { class: 'chip ok' }, `${p.videos.length} video(s)`) : null,
           p.source ? h('a', { class: 'chip accent', href: `#/discover/${enc(p.source.id)}/${enc(p.source.manga_id)}` }, `from ${p.source.id} ↗`) : null,
           p.source?.license ? h('span', { class: `chip ${p.source.license_verified ? 'ok' : 'warn'}` }, p.source.license_verified ? `✓ ${p.source.license}` : p.source.license) : null)),
-      h('div', { class: 'stack', style: { gap: '8px', alignItems: 'stretch' } },
-        h('button', { class: 'primary', onclick: () => go(`#/p/${enc(name)}?tab=make`) }, '▶ Make video'),
-        h('button', { class: 'danger', onclick: () => deleteProjectModal(name) }, '🗑 Delete…'))),
+      h('div', { class: 'row', style: { alignItems: 'flex-start' } },
+        p.videos.length && tab !== 'videos' ? h('a', { class: 'btn', href: `#/p/${enc(name)}?tab=videos` }, '▶ Watch') : null,
+        tab !== 'make' ? h('a', { class: 'btn primary', href: `#/p/${enc(name)}?tab=make` }, '🎬 Make video') : null,
+        h('button', { class: 'ghost', title: 'Delete project, cache or videos…', onclick: () => deleteProjectModal(name) }, '🗑'))),
     h('div', { class: 'tabs' }, tabs.map(([id, label]) => h('a', { href: `#/p/${enc(name)}?tab=${id}`, class: tab === id ? 'active' : '' }, label))),
     body);
   const renderers = { make: tabMake, options: tabOptions, script: tabScript, videos: tabVideos, chapters: tabChapters, images: tabImages, panels: tabPanels, usage: tabUsage };
@@ -539,7 +602,7 @@ function parseSpec(spec, total) {
 }
 
 // Chapter picker for the Make tab: returns { el, spec() } - spec '' = all chapters.
-function chapterPicker(p, index) {
+function chapterPicker(p, index, onchange = null) {
   const total = index.chapters.length;
   let sel = new Set(index.selected.length ? index.selected : index.chapters.map((c) => c.n));
   let last = null;
@@ -553,6 +616,7 @@ function chapterPicker(p, index) {
     const words = index.kind === 'book' ? index.chapters.filter((c) => sel.has(c.n)).reduce((a, c) => a + (c.words || 0), 0) : 0;
     summary.textContent = `${sel.size} of ${total} chapter(s)${words ? ` · ${(words / 1000).toFixed(0)}k words` : ''}`
       + (sel.size && sel.size < total ? ' · saved as a separate video' : '');
+    if (onchange) onchange();
   };
   specInput.addEventListener('input', () => { sel = parseSpec(specInput.value, total); if (!specInput.value.trim()) sel = new Set(index.chapters.map((c) => c.n)); sync(true); });
   for (const c of index.chapters) {
@@ -668,76 +732,321 @@ async function openViewer(project, n, total) {
   load(n);
 }
 
+// ------------------------------------------------------------------ voice picker
+const _voiceCache = new Map();
+function voiceCatalog(engine, lang) {
+  const k = `${engine}|${lang}`;
+  if (!_voiceCache.has(k)) _voiceCache.set(k, api(`/api/voices?engine=${enc(engine)}&lang=${enc(lang)}`).catch((e) => { _voiceCache.delete(k); throw e; }));
+  return _voiceCache.get(k);
+}
+let _sample = null;
+function stopSample() {
+  if (_sample) { _sample.pause(); _sample = null; }
+  document.querySelectorAll('.vplay.playing').forEach((b) => { b.classList.remove('playing'); b.textContent = '▶'; });
+}
+async function playSample(btn, { engine, voice, speed, lang, args }) {
+  if (btn.classList.contains('playing')) { stopSample(); return; }
+  stopSample();
+  btn.disabled = true; btn.textContent = '…';
+  btn.title = 'Voicing a sample (the first one loads the voice model, ~5-10 s)';
+  try {
+    const { url } = await api('/api/voice-sample', { json: { engine, voice: voice || null, speed: Number(speed) || 1, lang, args: args || {} } });
+    _sample = new Audio(url);
+    _sample.onended = stopSample;
+    btn.classList.add('playing'); btn.textContent = '■';
+    await _sample.play();
+  } catch (e) { toast(e.message, 'bad'); btn.textContent = '▶'; } finally { btn.disabled = false; btn.title = 'Play a sample'; }
+}
+function parseArgs(v) {
+  if (!v) return {};
+  if (typeof v === 'object') return v;
+  try { return JSON.parse(v); } catch { return {}; }
+}
+
+// Voice dropdown for the current engine + ▶ sample. ctx() -> {engine, lang, speed, args}; value '' = default voice.
+function voicePicker({ ctx, value, emptyLabel = (d) => `Default (${d})`, onchange }) {
+  let cur = value || '';
+  const sel = h('select', { 'aria-label': 'Voice' });
+  const text = h('input', { placeholder: 'Voice name (as the engine spells it)…', hidden: true });
+  const play = h('button', { type: 'button', class: 'vplay', title: 'Play a sample' }, '▶');
+  const refresh = async ({ clearUnknown = false } = {}) => {
+    const c = ctx();
+    sel.innerHTML = '';
+    sel.append(h('option', { value: '' }, 'Loading voices…'));
+    let cat;
+    try { cat = await voiceCatalog(c.engine, c.lang); } catch { cat = { voices: [], default: null }; }
+    const known = cat.voices.some((v) => v.value === cur);
+    if (cur && !known && clearUnknown) { cur = ''; onchange(''); }
+    const defLabel = cat.default ? (cat.voices.find((v) => v.value === cat.default)?.label || cat.default) : 'engine default';
+    sel.innerHTML = '';
+    sel.append(h('option', { value: '' }, emptyLabel(defLabel)));
+    const groups = new Map();
+    for (const v of cat.voices) { if (!groups.has(v.group)) groups.set(v.group, []); groups.get(v.group).push(v); }
+    for (const [g, vs] of groups) {
+      sel.append(h('optgroup', { label: vs[0].match ? `${g} · narration language` : g }, vs.map((v) => h('option', { value: v.value }, v.label))));
+    }
+    sel.append(h('option', { value: '__custom' }, 'Other voice name…'));
+    if (cur && !cat.voices.some((v) => v.value === cur)) { sel.value = '__custom'; text.hidden = false; text.value = cur; } else { sel.value = cur; text.hidden = true; }
+  };
+  sel.addEventListener('change', () => {
+    stopSample();
+    if (sel.value === '__custom') { text.hidden = false; text.focus(); cur = text.value.trim(); } else { text.hidden = true; cur = sel.value; }
+    onchange(cur);
+  });
+  text.addEventListener('input', () => { cur = text.value.trim(); onchange(cur); });
+  play.addEventListener('click', () => playSample(play, { ...ctx(), voice: cur || null }));
+  refresh();
+  return { el: h('div', { class: 'vpick' }, h('div', { class: 'vrow' }, sel, play), text), refresh, reset: () => { cur = ''; refresh(); } };
+}
+
+// ------------------------------------------------------------------ make video (studio)
+const STYLE_CARDS = [
+  ['auto', 'Auto', 'Motion for manga, Blur-fill for manhwa & books'],
+  ['motion', 'Motion', 'Panel cards slide in as the narration reaches them'],
+  ['blurfill', 'Blur-fill', 'One panel at a time over a blurred copy, slow zoom'],
+];
+const BACKGROUNDS = [['paper', 'Paper', '#efe9dc'], ['dark', 'Dark', '#22201c'], ['black', 'Black', '#0a0a0c'], ['white', 'White', '#f8f8f8'], ['blur', 'Blurred panel', 'linear-gradient(135deg,#6b7a99,#c79a8b)']];
+const LENGTHS = [[1.2, 'Short', 'fast-paced'], [2.5, 'Standard', 'like most recap channels'], [4, 'Detailed', 'more scenes and dialogue']];
+const PARTS = [[0, 'One video'], [15, '~15 min parts'], [20, '~20 min parts'], [30, '~30 min parts'], [60, '~1 h parts']];
+const RESOLUTIONS = [['1920x1080', '1080p'], ['1280x720', '720p'], ['2560x1440', '1440p'], ['3840x2160', '4K'], ['1080x1920', 'Vertical (Shorts)']];
+
+function stepCard(n, title, aside, ...body) {
+  return h('section', { class: 'card step' },
+    h('div', { class: 'stephead' }, h('span', { class: 'stepn' }, n), h('h2', {}, title), h('div', { class: 'spacer' }), aside),
+    ...body);
+}
+function segmented(options, value, onpick) {
+  const btns = options.map(([v, label, sub]) => h('button', { type: 'button', class: `seg ${String(v) === String(value) ? 'on' : ''}`, onclick: () => {
+    btns.forEach((b) => b.classList.remove('on')); btn(v).classList.add('on'); onpick(v);
+  } }, h('b', {}, label), sub ? h('span', {}, sub) : null));
+  const btn = (v) => btns[options.findIndex((o) => String(o[0]) === String(v))];
+  return h('div', { class: 'segs' }, btns);
+}
+
 async function tabMake(p) {
-  const untilSel = h('select', {}, [['render', 'Full video'], ['voice', 'Stop after voice'], ['script', 'Stop after script'], ['read', 'Stop after reading panels'], ['panels', 'Stop after cutting panels']]
+  const name = p.name;
+  const schema = await getSchema();
+  const ui = (k) => (schema.options.find((o) => o.key === k) || {}).ui || {};
+  const values = { ...p.values };
+  const eff = (k) => (k in values ? values[k] : p.inherited[k]);
+  const jobBox = h('div', { class: 'jobslot' });
+  let index = { kind: 'pages', chapters: [], selected: [], selection: '' };
+  try { index = await api(`/api/projects/${enc(name)}/chapter-index`); } catch (e) { toast(e.message, 'bad'); }
+
+  // quick settings are saved straight into this project's options (same file as the Options tab)
+  const saveState = h('span', { class: 'muted small' });
+  let saveTimer = null;
+  const setOpt = (key, v) => {
+    if (v === '' || v == null || String(v) === String(p.inherited[key])) delete values[key]; else values[key] = v;
+    saveState.textContent = 'Saving…';
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(async () => {
+      try {
+        await api(`/api/projects/${enc(name)}/config`, { method: 'PUT', json: values });
+        p.values = { ...values };
+        saveState.textContent = '✓ Saved to this project';
+        refreshEstimate();
+      } catch (e) { saveState.textContent = ''; toast(e.message, 'bad'); }
+    }, 350);
+    drawSummary();
+  };
+
+  // ---- 1. chapters
+  const chapterLine = h('span', { class: 'muted' });
+  let ready = false;
+  const picker = chapterPicker(p, index, () => { if (ready) { drawChapterLine(); drawSummary(); refreshEstimate(); } });
+  const pickerBox = h('div', { hidden: !index.selection && picker.count() === index.chapters.length });
+  const pickBtn = h('button', { type: 'button', class: 'small', onclick: () => { pickerBox.hidden = !pickerBox.hidden; drawChapterLine(); } });
+  const drawChapterLine = () => {
+    const n = picker.count(); const total = index.chapters.length;
+    const unread = index.chapters.filter((c) => !c.written).length;
+    chapterLine.textContent = !total ? 'No chapters yet' : n === total ? `All ${total} chapters` : `${n} of ${total} chapters (${picker.spec()})`;
+    if (total && unread && unread < total) chapterLine.textContent += ` · ${unread} not written yet`;
+    pickBtn.textContent = pickerBox.hidden ? 'Choose chapters…' : 'Hide list';
+  };
+  pickerBox.append(picker.el);
+  const chaptersStep = stepCard(1, 'Chapters', pickBtn,
+    index.chapters.length ? h('div', { class: 'row' }, chapterLine) : h('div', { class: 'row' }, h('span', { class: 'muted' }, 'No chapters yet.'),
+      h('a', { class: 'btn small', href: `#/p/${enc(name)}?tab=chapters` }, 'Add chapters'), p.source ? null : h('a', { class: 'btn small', href: '#/discover' }, '⬇ Download')),
+    pickerBox);
+
+  // ---- 2. look
+  const lookUrl = (style, bg) => `/api/projects/${enc(name)}/look-preview?style=${enc(style)}&background=${enc(bg || '')}&width=480`;
+  const resolved = (s) => (s && s !== 'auto' ? s : (['manhwa', 'book'].includes(p.detected_source) ? 'blurfill' : 'motion'));
+  const thumbs = {};
+  const styleCards = STYLE_CARDS.map(([id, label, desc]) => {
+    const img = h('img', { alt: `${label} preview`, loading: 'lazy', onerror: (e) => { e.target.replaceWith(h('div', { class: 'lookph' }, 'Preview after the first chapter is added')); } });
+    thumbs[id] = img;
+    return h('button', { type: 'button', class: `stylecard ${(eff('render.style') || 'auto') === id ? 'on' : ''}`, 'data-id': id, onclick: () => {
+      setOpt('render.style', id === 'auto' ? '' : id);
+      styleCards.forEach((c) => c.classList.toggle('on', c.dataset.id === id));
+      drawBg();
+    } }, img, h('div', { class: 'sctext' }, h('b', {}, label), h('span', { class: 'muted small' }, desc)));
+  });
+  const drawThumbs = () => { for (const [id] of STYLE_CARDS) thumbs[id].src = lookUrl(id, eff('render.background')); };
+  const bgRow = h('div', { class: 'row' });
+  const drawBg = () => {
+    bgRow.innerHTML = '';
+    if (resolved(eff('render.style')) !== 'motion') { bgRow.append(h('span', { class: 'muted small' }, 'Blur-fill always uses a blurred copy of the panel as the background.')); return; }
+    bgRow.append(h('span', { class: 'muted small' }, 'Background'), ...BACKGROUNDS.map(([id, label, color]) => h('button', {
+      type: 'button', class: `swatch ${(eff('render.background') || 'paper') === id ? 'on' : ''}`, title: label,
+      onclick: () => { setOpt('render.background', id); drawBg(); drawThumbs(); } }, h('i', { style: { background: color } }), label)));
+  };
+  drawThumbs(); drawBg();
+  const [rw, rh] = [eff('render.width') || 1920, eff('render.height') || 1080];
+  const resSel = h('select', { onchange: (e) => { const [w, hh] = e.target.value.split('x').map(Number); setOpt('render.width', w); setOpt('render.height', hh); drawThumbs(); } },
+    RESOLUTIONS.map(([v, l]) => h('option', { value: v }, `${l} · ${v.replace('x', '×')}`)),
+    RESOLUTIONS.some(([v]) => v === `${rw}x${rh}`) ? null : h('option', { value: `${rw}x${rh}` }, `${rw}×${rh} (custom)`));
+  resSel.value = `${rw}x${rh}`;
+  const lookStep = stepCard(2, 'Look', h('a', { class: 'small', href: `#/p/${enc(name)}?tab=options` }, 'More look options →'),
+    h('div', { class: 'stylecards' }, styleCards), bgRow,
+    h('div', { class: 'row' }, h('span', { class: 'muted small' }, 'Resolution'), h('div', { style: { width: '220px' } }, resSel)));
+
+  // ---- 3. voice
+  const langLabels = ui('lang').labels || {};
+  const engLabels = ui('tts.engine').labels || {};
+  const voiceCtx = () => ({ engine: eff('tts.engine') || 'kokoro', lang: eff('lang') || 'en', speed: eff('tts.speed') || 1, args: parseArgs(eff('tts.args')) });
+  const vp = voicePicker({ ctx: voiceCtx, value: values['tts.voice'] || '', emptyLabel: (d) => (p.inherited['tts.voice'] ? `${p.inherited['tts.voice']} (from Settings)` : `Default for the language (${d})`),
+    onchange: (v) => setOpt('tts.voice', v) });
+  const langSel = h('select', { onchange: (e) => { setOpt('lang', e.target.value); vp.refresh({ clearUnknown: true }); } },
+    Object.entries(langLabels).map(([v, l]) => h('option', { value: v }, l)));
+  langSel.value = eff('lang') || 'en';
+  const speed = rangeInput({ range: [0.7, 1.5, 0.05], value: values['tts.speed'] ?? '', inh: p.inherited['tts.speed'], onchange: (v) => setOpt('tts.speed', v) });
+  const voiceStep = stepCard(3, 'Narration', h('a', { class: 'small', href: `#/p/${enc(name)}?tab=options` }, 'Engine & pauses →'),
+    h('div', { class: 'grid3' },
+      h('div', { class: 'opt' }, h('label', {}, 'Language'), langSel),
+      h('div', { class: 'opt' }, h('label', {}, 'Voice ', h('span', { class: 'faint small' }, engLabels[voiceCtx().engine] ? `· ${engLabels[voiceCtx().engine].split(' - ')[0]}` : '')), vp.el,
+        h('div', { class: 'help' }, '▶ plays a short sample at the chosen speed.')),
+      h('div', { class: 'opt' }, h('label', {}, 'Speed'), speed.el, h('div', { class: 'help' }, '1.0 is relaxed (~170 wpm), 1.2 is fast like most recap channels.'))));
+
+  // ---- 4. length
+  const mpcNow = Number(eff('minutes_per_chapter') || 2.5);
+  const mpc = rangeInput({ range: [0.5, 6, 0.1], value: values.minutes_per_chapter ?? '', inh: p.inherited.minutes_per_chapter, onchange: (v) => setOpt('minutes_per_chapter', v) });
+  const lengthStep = stepCard(4, 'Length', null,
+    h('div', { class: 'grid2s' },
+      h('div', { class: 'opt' }, h('label', {}, 'Story per chapter'),
+        segmented(LENGTHS.map(([v, l, s]) => [v, l, `${v} min · ${s}`]), LENGTHS.some(([v]) => v === mpcNow) ? mpcNow : '', (v) => {
+          setOpt('minutes_per_chapter', v); mpc.el.querySelector('.rnum').value = v; mpc.el.querySelector('input[type=range]').value = v;
+        }),
+        h('details', { class: 'fine' }, h('summary', {}, 'Exact minutes per chapter'), mpc.el)),
+      h('div', { class: 'opt' }, h('label', {}, 'Split long recaps'),
+        (() => {
+          const s = h('select', { onchange: (e) => setOpt('episode_minutes', Number(e.target.value)) }, PARTS.map(([v, l]) => h('option', { value: v }, l)));
+          const cur = Number(eff('episode_minutes') || 0);
+          if (!PARTS.some(([v]) => v === cur)) s.append(h('option', { value: cur }, `~${cur} min parts`));
+          s.value = String(cur);
+          return s;
+        })(),
+        h('div', { class: 'help' }, 'Parts are whole chapters; parts 2+ open with a short "previously on".'))));
+
+  // ---- advanced
+  const untilSel = h('select', {}, [['render', 'Full video'], ['voice', 'Stop after voice'], ['script', 'Stop after script (review it first)'], ['read', 'Stop after reading panels'], ['panels', 'Stop after cutting panels']]
     .map(([v, l]) => h('option', { value: v }, l)));
   const force = Object.fromEntries(STAGES.map(([id]) => [id, h('input', { type: 'checkbox' })]));
   const preview = h('input', { type: 'checkbox' });
   const output = h('input', { placeholder: 'default: <title>_recap.mp4' });
-  const jobBox = h('div', {});
-  const estimateBox = h('div', {});
-  let index = { kind: 'pages', chapters: [], selected: [], selection: '' };
-  try { index = await api(`/api/projects/${enc(p.name)}/chapter-index`); } catch (e) { toast(e.message, 'bad'); }
-  const picker = chapterPicker(p, index);
-  api(`/api/projects/${enc(p.name)}/usage-log`).then((d) => {
-    const e = d.estimate;
+  const advanced = h('details', { class: 'card adv' }, h('summary', {}, 'Advanced run options'),
+    h('div', { class: 'optgrid', style: { marginTop: '12px' } },
+      h('div', { class: 'opt' }, h('label', {}, 'Stop after'), untilSel, h('div', { class: 'help' }, 'Stop after the script to read and edit it in the Script tab before voicing.')),
+      h('div', { class: 'opt' }, h('label', {}, 'Output file'), output),
+      h('div', { class: 'opt' }, h('label', {}, 'Redo stages (ignore cache)'),
+        h('div', { class: 'row' }, STAGES.map(([id, nm]) => h('label', { class: 'check' }, force[id], nm))),
+        h('div', { class: 'help' }, 'Finished work is cached and skipped unless ticked here.')),
+      h('div', { class: 'opt' }, h('label', {}, 'Extras'), h('label', { class: 'check' }, preview, 'Panel contact sheets (Panels tab)'))));
+
+  // ---- summary + start (sticky)
+  const sumRows = h('div', { class: 'sumrows' });
+  const estBox = h('div', { class: 'muted small' });
+  const warnBox = h('div', { class: 'stack', style: { gap: '6px' } });
+  const short = (spec) => (spec || '').split(',').map((s) => s.trim().replace(/^antigravity:/, '').replace(/^claude:/, 'Claude ')).filter(Boolean)[0] || '-';
+  const drawSummary = () => {
+    const v = eff('tts.voice') || 'default voice';
+    const st = eff('render.style') || 'auto';
+    const row = (k, val) => h('div', { class: 'sumrow' }, h('span', { class: 'muted' }, k), h('span', {}, val));
+    sumRows.innerHTML = '';
+    sumRows.append(
+      row('Chapters', index.chapters.length ? (picker.count() === index.chapters.length ? `all ${picker.count()}` : `${picker.count()} of ${index.chapters.length}`) : 'none'),
+      row('Look', `${STYLE_CARDS.find(([id]) => id === st)?.[1] || st}${resolved(st) === 'motion' ? ` · ${eff('render.background') || 'paper'}` : ''} · ${eff('render.height') || 1080}p`),
+      row('Voice', `${v.includes('_') ? v.split('_')[1] : v} · ${Number(eff('tts.speed') || 1).toFixed(2)}×`),
+      row('Length', `${eff('minutes_per_chapter') || 2.5} min / chapter${Number(eff('episode_minutes')) ? ` · ~${eff('episode_minutes')} min parts` : ''}`),
+      row('Models', `${short(eff('reader'))} reads · ${short(eff('writer'))} writes${eff('polisher') ? ` · ${short(eff('polisher'))} polishes` : ''}`));
+  };
+  let estSeq = 0;
+  const refreshEstimate = async () => {
+    const seq = ++estSeq;
+    const spec = picker.spec();
+    let e;
+    try { e = await api(`/api/projects/${enc(name)}/estimate${spec ? `?chapters=${enc(spec)}` : ''}`); } catch { return; }
+    if (seq !== estSeq) return;
+    estBox.innerHTML = '';
     if (!e || e.error) return;
-    const bits = [`~${e.reader.calls} reader call(s) (${e.reader.images} panel images)`, `~${e.writer.calls} writer call(s)`];
-    if (e.images.max) bits.push(`up to ${e.images.max} generated images${e.images.usd ? ` (≈ $${e.images.usd.toFixed(2)})` : ''}`);
-    estimateBox.append(h('div', { class: 'card tight row small' }, h('b', {}, 'Next run:'), h('span', { class: 'muted' }, bits.join(' · ')),
-      h('div', { class: 'spacer' }), h('a', { href: `#/p/${enc(p.name)}?tab=usage` }, 'Usage & history →')));
+    const calls = e.reader.calls + e.writer.calls + (e.polisher ? e.polisher.calls : 0);
+    estBox.append(...[
+      h('div', { class: 'bigest' }, `≈ ${fmtMin(e.video.minutes)}`, e.video.parts > 1 ? h('span', { class: 'muted small' }, ` in ${e.video.parts} parts`) : null),
+      h('div', {}, calls ? `${calls} model call(s) to make` : 'Everything is already read and written', e.reader.images ? ` · ${e.reader.images} panel images to read` : ''),
+      e.images.usd ? h('div', { class: 'chip warn' }, `up to $${e.images.usd.toFixed(2)} of generated images`) : null,
+      h('a', { class: 'small', href: `#/p/${enc(name)}?tab=usage` }, 'Cost details & history →')].filter(Boolean));
+  };
+  getDoctor().then((doctor) => {  // availability warnings arrive without holding up the page
+    for (const [role, spec] of [['Reader', eff('reader')], ['Writer', eff('writer')], ['Polisher', eff('polisher')]]) {
+      if (!spec) continue;
+      const ok = String(spec).split(',').map((s) => s.trim()).some((n) => {
+        const key = Object.keys(doctor.providers).find((k) => n.startsWith(k.split(':')[0])
+          || (k === 'deepseek-free' && n.includes('opencode')) || (k === 'antigravity' && (n === 'agy' || n.startsWith('agy:'))));
+        return !key || doctor.providers[key].ok;
+      });
+      if (!ok) warnBox.append(h('div', { class: 'chip warn' }, `${role} (${spec}) looks unavailable here - see System check.`));
+    }
   }).catch(() => {});
-  const doctor = await getDoctor();
-  const warn = [];
-  const eff = p.effective;
-  for (const [role, spec] of [['Reader', eff.reader], ['Writer', eff.writer]]) {
-    const names = spec.split(',').map((s) => s.trim());
-    const ok = names.some((n) => {
-      const key = Object.keys(doctor.providers).find((k) => n.startsWith(k.split(':')[0])
-        || (k === 'deepseek-free' && n.includes('opencode'))
-        || (k === 'antigravity' && (n === 'agy' || n.startsWith('agy:'))));
-      return !key || doctor.providers[key].ok;
-    });
-    if (!ok) warn.push(`${role} (${spec}) looks unavailable on this machine - check System check.`);
-  }
-  if (!p.chapters) warn.push('No chapters yet - add some in the Chapters tab or download them.');
+
   const start = async (quick = false) => {
     if (index.chapters.length && !picker.count()) { toast('Pick at least one chapter', 'bad'); return; }
     // '' = all: send an explicit full range when the project's saved options narrow the selection
     const chapters = picker.spec() || (index.selection ? `1-${index.chapters.length}` : null);
+    clearTimeout(saveTimer);
     try {
-      const job = await api(`/api/projects/${enc(p.name)}/run`, { json: {
+      await api(`/api/projects/${enc(name)}/config`, { method: 'PUT', json: values });  // flush pending quick settings
+      const job = await api(`/api/projects/${enc(name)}/run`, { json: {
         until: quick ? 'render' : untilSel.value, force: Object.entries(force).filter(([, el]) => el.checked).map(([k]) => k),
         preview: preview.checked, output: output.value.trim() || null, quick, chapters,
       } });
-      watchJob(job.id, jobBox, { project: p.name });
+      if (job.status === 'queued') toast(`Queued (#${job.position}) - starts when the video before it finishes`, 'ok');
+      askNotify();
+      lockButtons(true);
+      watchJob(job.id, jobBox, { project: name, onDone: () => lockButtons(false) });
+      jobBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
     } catch (e) { toast(e.message, 'bad'); }
   };
-  if (p.active_job) setTimeout(() => watchJob(p.active_job, jobBox, { project: p.name }), 0);
+  const goBtn = h('button', { class: 'primary big', onclick: () => start(false) }, '▶ Make video');
+  const quickBtn = h('button', { class: 'wide', onclick: () => start(true), title: 'The first ~60 s at 480p: check look, voice and pacing in a minute. Its audio is reused by the full run.' }, '⚡ Quick preview (~60 s)');
+  const lockButtons = (on) => { goBtn.disabled = on; quickBtn.disabled = on; };
+  if (p.active_job) { lockButtons(true); setTimeout(() => watchJob(p.active_job, jobBox, { project: name, onDone: () => lockButtons(false) }), 0); }
+  const latest = p.videos_detail[0];
+  const aside = h('aside', { class: 'card summary' },
+    h('h2', {}, 'Your video'), sumRows, h('hr'), estBox, warnBox,
+    goBtn, quickBtn,
+    h('div', { class: 'faint small' }, 'Videos are made one at a time; extra runs wait in a queue. Everything already made is reused.', ' ', saveState),
+    latest ? h('a', { class: 'latest', href: `#/p/${enc(name)}?tab=videos` }, h('span', {}, '▶'), h('div', {}, h('b', {}, latest.name), h('div', { class: 'faint small' }, `${fmtBytes(latest.size)} · ${fmtDate(latest.modified)}`))) : null);
+
+  drawChapterLine(); drawSummary(); refreshEstimate();
+  ready = true;
   const recent = p.jobs.filter((j) => j.id !== p.active_job).slice(0, 5);
   return h('div', { class: 'stack' },
-    warn.length ? h('div', { class: 'card tight stack' }, warn.map((w) => h('div', { class: 'chip warn' }, w))) : null,
-    h('div', { class: 'card' },
-      h('div', { class: 'section-title' }, h('h2', {}, 'Run'), h('span', { class: 'muted small' },
-        `reader ${eff.reader} · writer ${eff.writer} · style ${eff.style}`), h('div', { class: 'spacer' }),
-        h('a', { class: 'small', href: `#/p/${enc(p.name)}?tab=options` }, 'Change options →')),
-      h('div', { class: 'optgrid' },
-        picker.el,
-        h('div', { class: 'opt' }, h('label', {}, 'Stop after'), untilSel, h('div', { class: 'help' }, 'Stop after the script to review/edit it before voicing.')),
-        h('div', { class: 'opt' }, h('label', {}, 'Output file'), output),
-        h('div', { class: 'opt' }, h('label', {}, 'Redo stages (ignore cache)'),
-          h('div', { class: 'row' }, STAGES.map(([id, name]) => h('label', { class: 'check' }, force[id], name))),
-          h('div', { class: 'help' }, 'Everything is cached; finished stages are skipped unless ticked here.')),
-        h('div', { class: 'opt' }, h('label', {}, 'Extras'), h('label', { class: 'check' }, preview, 'Write panel contact sheets (Panels tab)'))),
-      h('div', { class: 'row end', style: { marginTop: '14px' } },
-        h('span', { class: 'muted small' }, 'Quick preview: the first ~60 s at 480p, to check look, voice and pacing. Its audio is reused by the full run.'),
-        h('button', { onclick: () => start(true), disabled: !!p.active_job, title: 'Writes <title>_recap_preview.mp4' }, '⚡ Quick preview'),
-        h('button', { class: 'primary', onclick: () => start(false), disabled: !!p.active_job }, '▶ Start'))),
-    estimateBox,
     jobBox,
-    recent.length ? h('div', { class: 'card' }, h('h3', {}, 'Recent runs'), recent.map((j) => h('div', { class: 'row', style: { padding: '6px 0' } },
-      statusChip(j.status), h('span', {}, j.title), h('span', { class: 'muted small' }, fmtDate(j.created)),
-      j.error ? h('span', { class: 'faint small' }, j.error.slice(0, 120)) : null))) : null);
+    h('div', { class: 'studio' },
+      h('div', { class: 'stack' }, chaptersStep, lookStep, voiceStep, lengthStep, advanced,
+        recent.length ? h('details', { class: 'card adv' }, h('summary', {}, `Recent runs (${recent.length})`), recent.map((j) => h('div', { class: 'row', style: { padding: '6px 0' } },
+          statusChip(j.status), h('span', {}, j.title), h('span', { class: 'muted small' }, fmtDate(j.created)),
+          j.error ? h('span', { class: 'faint small' }, j.error.slice(0, 120)) : null))) : null),
+      aside));
+}
+
+// browser notification when a run finishes in a background tab
+function askNotify() {
+  try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch { /* unsupported */ }
+}
+function notify(title, body) {
+  try { if ('Notification' in window && Notification.permission === 'granted' && document.hidden) new Notification(title, { body }); } catch { /* unsupported */ }
 }
 
 // ------------------------------------------------------------------ usage
@@ -756,6 +1065,7 @@ function estimateCard(e, p) {
     h('div', { class: 'tablewrap' }, h('table', {}, h('tbody', {},
       row('Reader (vision)', `~${e.reader.calls} call(s) · ~${e.reader.images} panel images sent`, billChip(e.reader.billing)),
       row('Writer', `~${e.writer.calls} call(s)`, billChip(e.writer.billing)),
+      e.polisher && e.polisher.spec ? row('Polisher', `~${e.polisher.calls} call(s) · ${e.polisher.spec}`, billChip(e.polisher.billing)) : null,
       row('Image generation', gen, e.images.usd ? h('span', { class: 'chip warn tiny' }, `≈ $${e.images.usd.toFixed(2)} max`) : null),
       row('Voice', `~${e.voice.words.toLocaleString()} words with ${e.voice.engine} (only changed lines are re-voiced)`),
       row('Video', `~${e.video.minutes} min${e.video.parts > 1 ? ` in ${e.video.parts} parts` : ''}`),
@@ -1031,9 +1341,14 @@ function multiSelect({ load, value, placeholder, onchange }) {
 }
 
 // Shared editor for a project's recaper.toml and the global settings file.
-// values = keys this file sets; base[key] = what applies when the key is left empty; from[key] = 'global' | 'cwd' (else default).
+// options shown in the Essentials view (everything else is under All options or search)
+const ESSENTIAL_OPTIONS = new Set(['lang', 'minutes_per_chapter', 'target_minutes', 'episode_minutes', 'extra_instructions', 'hook', 'outro', 'reader', 'writer', 'polisher',
+  'tts.engine', 'tts.voice', 'tts.speed', 'render.style', 'render.width', 'render.height', 'render.background', 'render.layout', 'render.quality', 'images.generator']);
 function optionsEditor({ schema, values, base, from = {}, skip = [], self = null, intro, onSave, toml = '' }) {
   const fromLabel = (k) => ({ global: 'Global', cwd: 'Folder' }[from[k]] || 'Default');
+  const watchers = {};  // key -> [fn]: fields that depend on another field (the voice list on the engine)
+  const watch = (k, fn) => (watchers[k] = watchers[k] || []).push(fn);
+  const valueOf = (k) => (k in values ? values[k] : base[k]);
   const tomlPre = h('pre', { class: 'log mono', style: { height: 'auto', maxHeight: '240px' } }, toml || 'Nothing set yet: save to see the generated file.');
   const fieldFor = (o) => {
     const cur = values[o.key];
@@ -1044,13 +1359,25 @@ function optionsEditor({ schema, values, base, from = {}, skip = [], self = null
     const onchange = (v) => {
       if (v === '' || v === null) delete values[o.key]; else values[o.key] = v;
       wrap.classList.toggle('changed', o.key in values);
+      (watchers[o.key] || []).forEach((fn) => fn());
+      countChanged();
     };
     let input;
     let resetUi = null;
     const ui = o.ui || {};
     const labelOf = (x) => (ui.labels && ui.labels[x]) || (ui.groups && ui.groups.flatMap((g) => g.options).find(([a]) => a === x)?.[1]) || x;
     const emptyLabel = `${src} (${def === '' ? 'auto' : labelOf(def)})`;
-    if ((o.kind === 'int' || o.kind === 'number') && ui.range) {
+    if (o.key === 'tts.voice') {
+      const vp = voicePicker({
+        value: shown,
+        ctx: () => ({ engine: valueOf('tts.engine') || 'kokoro', lang: valueOf('lang') || 'en', speed: valueOf('tts.speed') || 1, args: parseArgs(valueOf('tts.args')) }),
+        emptyLabel: (d) => `${src} (${def || d})`,
+        onchange,
+      });
+      watch('tts.engine', () => vp.refresh({ clearUnknown: true }));
+      watch('lang', () => vp.refresh());
+      input = vp.el; resetUi = vp.reset;
+    } else if ((o.kind === 'int' || o.kind === 'number') && ui.range) {
       const r = rangeInput({ range: ui.range, zero: ui.zero, value: shown, inh, onchange });
       input = r.el; resetUi = r.reset;
     } else if (o.kind === 'projects' && ui.multi) {
@@ -1069,7 +1396,7 @@ function optionsEditor({ schema, values, base, from = {}, skip = [], self = null
       resetUi = () => { box.checked = !!inh; };
     } else if (o.kind === 'models') {
       const ms = modelsSelect({
-        schema, value: shown, placeholder: `${src} (${def})`, needVision: o.key === 'reader', onchange,
+        schema, value: shown, placeholder: o.key === 'polisher' && !def ? 'Same as the writer' : `${src} (${def})`, needVision: o.key === 'reader', onchange,
       });
       input = ms.el;
       resetUi = ms.reset;
@@ -1106,7 +1433,8 @@ function optionsEditor({ schema, values, base, from = {}, skip = [], self = null
       delete values[o.key]; wrap.classList.remove('changed');
       if (resetUi) resetUi(); else { const el = wrap.querySelector('input,select,textarea'); el.value = ''; }
     } }, 'reset');
-    const wrap = h('div', { class: `opt ${o.kind === 'textarea' || o.kind === 'json' ? 'wide' : ''} ${o.key in values ? 'changed' : ''}` },
+    const wrap = h('div', { class: `opt ${o.kind === 'textarea' || o.kind === 'json' ? 'wide' : ''} ${o.key in values ? 'changed' : ''}`, 'data-key': o.key,
+      'data-text': `${o.key} ${o.label} ${o.help || ''}`.toLowerCase() },
       h('label', {}, reset, o.label, from[o.key] === 'global' ? h('span', { class: 'chip tiny', title: 'Set on the Settings page (applies to every project)' }, 'global') : null),
       input, o.help ? h('div', { class: 'help' }, o.help) : null, h('div', { class: 'faint small mono' }, o.key));
     return wrap;
@@ -1116,17 +1444,53 @@ function optionsEditor({ schema, values, base, from = {}, skip = [], self = null
       const res = await onSave(values);
       tomlPre.textContent = res.toml || '(empty: everything inherited)';
       toast('Options saved', 'ok');
+      initial = JSON.stringify(values); countChanged();
     } catch (e) { toast(e.message, 'bad'); }
   };
-  const groups = schema.groups.map((g) => {
+  let initial = JSON.stringify(values);
+  const changedNote = h('span', { class: 'muted small' });
+  STATE.leaveGuard = () => JSON.stringify(values) === initial || confirm('You have unsaved option changes. Leave without saving?');
+  function countChanged() {
+    const dirty = JSON.stringify(values) !== initial;
+    const n = Object.keys(values).length;
+    changedNote.textContent = `${n} set here${dirty ? ' · unsaved changes' : ''}`;
+    changedNote.classList.toggle('warntext', dirty);
+  }
+  let mode = lsGet('rc.optmode', 'basic');
+  const search = h('input', { type: 'search', placeholder: 'Search options…', style: { maxWidth: '240px' } });
+  const cards = schema.groups.map((g) => {
     const items = schema.options.filter((o) => o.group === g.id && !skip.includes(o.key));
-    return items.length ? h('div', { class: 'card optgroup' }, h('h2', {}, g.label), h('div', { class: 'optgrid' }, items.map(fieldFor))) : null;
-  });
+    return items.length ? h('div', { class: 'card optgroup', id: `og-${g.id}` }, h('h2', {}, g.label), h('div', { class: 'optgrid' }, items.map(fieldFor))) : null;
+  }).filter(Boolean);
+  const nav = h('div', { class: 'optnav' });
+  const apply = () => {
+    const q = search.value.trim().toLowerCase();
+    nav.innerHTML = '';
+    let shown = 0;
+    for (const card of cards) {
+      let any = false;
+      card.querySelectorAll('.opt[data-key]').forEach((el) => {
+        const k = el.dataset.key;
+        const vis = q ? el.dataset.text.includes(q) : (mode === 'all' || ESSENTIAL_OPTIONS.has(k) || k in values);
+        el.hidden = !vis; any = any || vis; shown += vis ? 1 : 0;
+      });
+      card.hidden = !any;
+      if (any) nav.append(h('a', { href: '#', onclick: (e) => { e.preventDefault(); card.scrollIntoView({ behavior: 'smooth', block: 'start' }); } }, card.querySelector('h2').textContent));
+    }
+    modeBtns.forEach((b) => b.classList.toggle('on', b.dataset.mode === mode && !q));
+    empty.hidden = shown > 0;
+  };
+  const empty = h('div', { class: 'card empty', hidden: true }, 'No option matches that search.');
+  const modeBtns = [['basic', 'Essentials'], ['all', 'All options']].map(([m, label]) => h('button', { type: 'button', class: 'seg small', 'data-mode': m, onclick: () => { mode = m; lsSet('rc.optmode', m); search.value = ''; apply(); } }, label));
+  search.addEventListener('input', apply);
+  countChanged();
+  setTimeout(apply, 0);
   return h('div', {},
-    h('div', { class: 'row', style: { marginBottom: '14px' } },
-      h('p', { class: 'muted', style: { margin: 0, flex: 1 } }, intro),
+    h('p', { class: 'muted', style: { margin: '0 0 12px' } }, intro),
+    h('div', { class: 'optbar' },
+      h('div', { class: 'segs' }, modeBtns), search, nav, h('div', { class: 'spacer' }), changedNote,
       h('button', { class: 'primary', onclick: save }, 'Save options')),
-    groups,
+    cards, empty,
     h('div', { class: 'card' }, h('h3', {}, 'Generated file'), tomlPre),
     h('div', { class: 'row end', style: { marginTop: '14px' } }, h('button', { class: 'primary', onclick: save }, 'Save options')));
 }

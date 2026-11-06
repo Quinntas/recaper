@@ -126,7 +126,7 @@ def render_video(
 ) -> None:
     chunk_seconds = chunk_seconds or rcfg.chunk_seconds
     look = {k: getattr(rcfg, k) for k in Look.__dataclass_fields__}
-    shots = build_shots(timed_beats, style)
+    shots = build_shots(timed_beats, style, look=Look.from_dict(look))
     if not shots:
         raise RuntimeError("nothing to render")
     used = {p for s in shots for p in s.panels}

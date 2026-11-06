@@ -123,6 +123,30 @@ def summarize(rows: list[dict]) -> list[dict]:
     return out
 
 
+PACE_FILE = "voice_pace.json"
+
+
+def save_pace(work_dir: Path, tcfg: Any, words: int, seconds: float) -> None:
+    """Remember how fast the last narration really was (words over its length, pauses included)."""
+    data = {"engine": tcfg.engine, "voice": tcfg.voice, "speed": tcfg.speed, "words": words, "seconds": round(seconds, 1)}
+    try:
+        (work_dir / PACE_FILE).write_text(json.dumps(data), "utf-8")
+    except OSError:
+        pass
+
+
+def pace(work_dir: Path, cfg: Any) -> float:
+    """Narration words per minute: measured on this project's last voicing (scaled to the current speed) when
+    it used the same engine, else the nominal pace from the settings."""
+    try:
+        m = json.loads((work_dir / PACE_FILE).read_text("utf-8"))
+        if m.get("engine") == cfg.tts.engine and m.get("seconds", 0) > 30 and m.get("speed"):
+            return m["words"] / (m["seconds"] / 60) * cfg.tts.speed / m["speed"]
+    except (OSError, ValueError, KeyError, TypeError, ZeroDivisionError):
+        pass
+    return cfg.spoken_wpm
+
+
 def estimate(project_dir: Path, cfg: Any, chapters: list[dict], is_book: bool) -> dict:
     """Rough cost of the next full run, from what is already cached. `chapters` = the UI's cheap listing
     ([{title, pages}], in pipeline order). Numbers are upper-bound-ish estimates, not promises."""
@@ -135,7 +159,7 @@ def estimate(project_dir: Path, cfg: Any, chapters: list[dict], is_book: bool) -
         extracted = [c for f in sorted((work / "book").glob("*/chapters.json")) for c in json.loads(f.read_text("utf-8"))]
         chapters = [{"title": c.get("title"), "pages": 0} for c in extracted] or [{"title": "?", "pages": 0}] * (12 * len(chapters))
     picked = parse_chapter_ranges(cfg.chapters, len(chapters)) if chapters else []
-    reader_calls = images_sent = writer_calls = 0
+    reader_calls = images_sent = writer_calls = polish_calls = 0
     unread = unwritten = 0
     panels_known = 0
     for i in picked:
@@ -154,18 +178,24 @@ def estimate(project_dir: Path, cfg: Any, chapters: list[dict], is_book: bool) -
                 writer_calls += 1  # prose digest
         if not any((work / "script").glob(f"{cid}_*.json")):
             unwritten += 1
-            writer_calls += 1 + (1 if cfg.polish else 0)
+            writer_calls += 1
+            polish_calls += 1 if cfg.polish else 0
     has_script = (work / "script.json").exists()
     if unread:
         writer_calls += 1  # bible reconciliation
     if not has_script or unwritten:
         writer_calls += (1 if cfg.hook else 0) + (1 if is_book and unread else 0)  # hook (+ related-works map)
-    minutes = cfg.target_minutes or len(picked) * cfg.minutes_per_chapter
+    # word targets use words_per_minute; the voice speed decides how long they take to say
+    wpm = pace(work, cfg)
+    minutes = (cfg.target_minutes or len(picked) * cfg.minutes_per_chapter) * cfg.words_per_minute / wpm
     if has_script:  # the real length beats the target
         try:
             sc = json.loads((work / "script.json").read_text("utf-8"))
             words = sum(len(b["text"].split()) for c in [{"beats": sc.get("hook", [])}, *sc.get("chapters", [])] for b in c["beats"])
-            minutes = words / max(1, cfg.words_per_minute)
+            minutes = words / max(1, wpm)
+            n_script = len(sc.get("chapters", []))
+            if picked and n_script and len(picked) != n_script:  # a different selection: scale the script's pace
+                minutes *= len(picked) / n_script
         except (OSError, ValueError, KeyError):
             pass
     parts = math.ceil(minutes / cfg.episode_minutes) if cfg.episode_minutes and minutes > cfg.episode_minutes * 1.25 else 1
@@ -185,9 +215,11 @@ def estimate(project_dir: Path, cfg: Any, chapters: list[dict], is_book: bool) -
     return {
         "chapters": len(picked), "unread": unread, "unwritten": unwritten,
         "reader": {"spec": cfg.reader, "calls": reader_calls, "images": images_sent, "billing": reader_bill},
-        "writer": {"spec": cfg.writer, "calls": writer_calls, "billing": writer_bill},
+        "writer": {"spec": cfg.writer, "calls": writer_calls + (0 if cfg.polisher else polish_calls), "billing": writer_bill},
+        "polisher": {"spec": cfg.polisher, "calls": polish_calls if cfg.polisher else 0,
+                     "billing": sorted({billing(p) for p in cfg.polisher.split(",") if p.strip()})},
         "images": {"spec": cfg.images.generator, "max": gen, "usd": image_cost},
-        "voice": {"engine": cfg.tts.engine, "words": int(minutes * cfg.words_per_minute)},
+        "voice": {"engine": cfg.tts.engine, "words": int(minutes * wpm)},
         "video": {"minutes": round(minutes, 1), "parts": parts},
         "upscaler": {"mode": cfg.render.upscaler, "cached": upscaled},
         "panels_known": panels_known,

@@ -102,13 +102,14 @@ META: dict[str, tuple] = {
     "source": ("story", "Source type", "auto detects light novels / books (EPUB, text PDF, TXT), long colour strips (manhwa) and pages (manga).", "select", ["auto", "manga", "manhwa", "book"], None),
     "reading": ("story", "Manga reading order", "Panel order on manga pages. auto = right-to-left for manga.", "select", ["auto", "rtl", "ltr"], None),
     "reader": ("models", "Reader (vision)", "Model(s) that look at the panels, tried in order (the next one takes over when one fails or runs out of quota). Must support images.", "models", None, PROVIDERS),
+    "polisher": ("models", "Polisher", "Model(s) for the polish pass, tried in order. Empty = the writer. Pick a stronger model here when the writer is a local one: it drafts, this one line-edits.", "models", None, PROVIDERS),
     "writer": ("models", "Writer", "Model(s) that write the narration, tried in order. Text-only models (DeepSeek free) are fine here.", "models", None, PROVIDERS),
     "jobs": ("models", "Parallel model calls", "Chapters read/written at the same time.", "int", None, None),
     "read_batch": ("models", "Panels per reader call", "Max images per vision request.", "int", None, None),
-    "words_per_minute": ("models", "Narration pace (wpm)", "Used to turn minutes into word targets. ~200 at voice speed 1.2.", "int", None, None),
+    "words_per_minute": ("models", "Script words per minute", "Turns minutes into word targets (the pace at voice speed 1.2). A slower voice makes the same script longer.", "int", None, None),
     "tts.engine": ("voice", "TTS engine", "RealtimeTTS engine. Local GPU: kokoro, coqui. Cloud: edge, openai, elevenlabs, azure...", "select", sorted(ENGINE_CLASSES), None),
     "tts.voice": ("voice", "Voice", "Engine-specific voice name. Empty = default for the language.", "text", None, KOKORO_VOICES + sorted({v for d in DEFAULT_VOICES.values() for v in d.values()})),
-    "tts.speed": ("voice", "Speed", "1.2 ≈ 200 wpm (top recap channels are 200-240).", "number", None, None),
+    "tts.speed": ("voice", "Speed", "1.0 ≈ 170 wpm (relaxed), 1.2 ≈ 200 wpm (fast recap channels).", "number", None, None),
     "tts.beat_gap": ("voice", "Pause between beats (s)", "", "number", None, None),
     "tts.chapter_gap": ("voice", "Pause between chapters (s)", "", "number", None, None),
     "tts.workers": ("voice", "Parallel voice workers", "0 = auto (3 for local GPU engines, 1 for cloud APIs).", "int", None, None),
@@ -120,7 +121,7 @@ META: dict[str, tuple] = {
     "render.quality": ("video", "Quality (CQ/CRF)", "Lower = better & bigger. 18-23 is typical.", "int", None, None),
     "render.loudness": ("video", "Loudness (LUFS)", "Integrated loudness of the final mix. YouTube normalises to -14.", "number", None, None),
     "render.background": ("look", "Background (motion style)", "paper, black, white, dark, blur (blurred current panel) or any #rrggbb colour.", "color", BACKGROUNDS, None),
-    "render.layout": ("look", "Multi-panel layout (motion)", "cascade = each panel big, overlapping, newest on top. row = side by side.", "select", ["cascade", "row"], None),
+    "render.layout": ("look", "Multi-panel layout (motion)", "clean = at most two panels at once, never overlapping. cascade = each panel big, overlapping, newest on top. row = all side by side.", "select", ["clean", "cascade", "row"], None),
     "render.reveal": ("look", "Panel reveal (motion)", "progressive = panels appear as the narration reaches them. together = all at the start of the beat.", "select", ["progressive", "together"], None),
     "render.card_border": ("look", "Card border (motion)", "Thin outline around each panel card.", "bool", None, None),
     "render.shadow": ("look", "Shadow strength", "Drop-shadow multiplier. 0 = none.", "number", None, None),
@@ -214,7 +215,7 @@ UI: dict[str, dict] = {
     "render.fps": {"labels": {str(v): f"{v} fps" for v in (24, 25, 30, 50, 60)}, "custom": True},
     "render.quality": {"range": [14, 35, 1]},
     "render.loudness": {"range": [-24, -9, 0.5]},
-    "render.layout": {"labels": {"cascade": "Cascade - big, overlapping, newest on top", "row": "Row - side by side"}},
+    "render.layout": {"labels": {"clean": "Clean - one or two panels, never overlapping", "cascade": "Cascade - big, overlapping, newest on top", "row": "Row - all side by side"}},
     "render.reveal": {"labels": {"progressive": "Progressive - as the narration reaches them", "together": "Together - all at the start"}},
     "render.shadow": {"range": [0, 2, 0.05]},
     "render.camera": {"range": [0, 2, 0.05]},
@@ -401,6 +402,8 @@ def _check(values: dict[str, Any]) -> None:
     _apply(cfg, values)  # raises on bad keys
     make_chain(_expand_aliases(cfg.reader), "reader", need_vision=True)
     make_chain(_expand_aliases(cfg.writer), "writer", need_vision=False)
+    if cfg.polisher.strip():
+        make_chain(_expand_aliases(cfg.polisher), "polisher", need_vision=False)
     if cfg.render.width % 2 or cfg.render.height % 2:
         raise ValueError("width and height must be even")
     from ..render.styles import make_background

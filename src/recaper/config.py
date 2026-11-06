@@ -46,10 +46,10 @@ PROVIDER_ALIASES = {
 class TTSConfig:
     engine: str = "kokoro"
     voice: str | None = None  # engine-specific; None = per-language default
-    speed: float = 1.2  # top recap channels narrate at ~200-240 wpm
+    speed: float = 1.0  # Kokoro at 1.0 ~ 170 wpm, an easy listening pace (1.2 ~ 200 wpm)
     args: dict[str, Any] = field(default_factory=dict)  # extra engine constructor kwargs
-    beat_gap: float = 0.18  # silence between beats (s)
-    chapter_gap: float = 0.6  # extra silence at chapter boundaries (s)
+    beat_gap: float = 0.25  # silence between beats (s)
+    chapter_gap: float = 1.2  # extra silence at chapter boundaries (s)
     workers: int = 0  # parallel TTS processes; 0 = auto (3 for local GPU engines, 1 for APIs)
 
 
@@ -65,7 +65,7 @@ class RenderConfig:
     loudness: float = -16.0  # integrated LUFS target for the final mix
     # --- look & motion (all styles) ---
     background: str = "paper"  # motion style: paper | black | white | dark | blur | #rrggbb
-    layout: str = "cascade"  # motion style, beats with several panels: cascade | row
+    layout: str = "clean"  # motion style, beats with several panels: clean (max 2, no overlap) | cascade | row
     reveal: str = "progressive"  # motion style: progressive (panels appear as narration reaches them) | together
     card_border: bool = True  # thin border around panel cards (motion style)
     shadow: float = 1.0  # drop-shadow strength multiplier (0 = none)
@@ -111,12 +111,13 @@ class Config:
     reading: str = "auto"  # auto | rtl | ltr (manga panel order)
     reader: str = "claude:sonnet"  # vision model(s) that read panels; comma = fallback chain
     writer: str = "claude:sonnet"  # model(s) that write the narration script
+    polisher: str = ""  # model(s) for the polish pass; empty = the writer (a stronger editor helps local writers)
     minutes_per_chapter: float = 2.5
     target_minutes: float | None = None  # overrides minutes_per_chapter when set
-    words_per_minute: int = 200  # narration pace at tts.speed 1.2 (Kokoro); used for length targets
+    words_per_minute: int = 200  # script words per target minute (the Kokoro pace at tts.speed 1.2)
     chapters: str | None = None  # e.g. "1-20,25"
     title: str | None = None
-    read_batch: int = 36  # max panel images per reader call
+    read_batch: int = int(os.environ.get("RECAPER_READ_BATCH", "36"))  # max panel images per reader call
     jobs: int = 6  # parallel model calls (chapters read / written concurrently)
     extra_instructions: str = ""  # appended to the writer prompt (tone, nicknames, etc.)
     hook: bool = True  # open with a cold-open hook
@@ -133,6 +134,11 @@ class Config:
     render: RenderConfig = field(default_factory=RenderConfig)
 
     # ---- loading -------------------------------------------------------
+    @property
+    def spoken_wpm(self) -> float:
+        """Narration words per minute at the chosen voice speed (words_per_minute is the pace at speed 1.2)."""
+        return self.words_per_minute * max(self.tts.speed, 0.1) / 1.2
+
     @classmethod
     def load(cls, input_dir: Path, overrides: dict[str, Any] | None = None) -> "Config":
         cfg = cls()
@@ -147,6 +153,7 @@ class Config:
             _apply(cfg, {k: v for k, v in overrides.items() if v is not None})
         cfg.reader = _expand_aliases(cfg.reader)
         cfg.writer = _expand_aliases(cfg.writer)
+        cfg.polisher = _expand_aliases(cfg.polisher) if cfg.polisher.strip() else ""
         return cfg
 
 

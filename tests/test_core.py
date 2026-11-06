@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from recaper.config import Config, parse_chapter_ranges
+from recaper.config import Config, TTSConfig, parse_chapter_ranges
 from recaper.ingest import detect_source, discover
 from recaper.llm import Chain, Provider, QuotaError, extract_json, make_chain
 from recaper.llm.opencode import _text_from_events
@@ -180,7 +180,37 @@ def test_build_shots_splits_beats_for_blurfill():
     assert [s.panels for s in shots] == [["a"], ["b"], ["c"]]
     assert shots[0].emphasis == "hit" and shots[1].emphasis == "normal"
     assert shots[-1].end == 6.0
-    assert len(build_shots(beats, "motion")) == 1
+    from recaper.render.styles import Look
+
+    assert len(build_shots(beats, "motion", look=Look(layout="cascade"))) == 1
+
+
+def test_motion_clean_steps_never_overlap(tmp_path):
+    from recaper.render.styles import Look
+
+    beats = [{"start": 0.0, "end": 6.0, "panels": ["a", "b", "tall"], "emphasis": "hit"},
+             {"start": 6.0, "end": 9.0, "panels": ["tall"], "emphasis": "normal"}]
+    shots = build_shots(beats, "motion")
+    assert [s.panels for s in shots] == [["a"], ["a", "b"], ["b", "tall"], ["tall"]]
+    assert shots[0].emphasis == "hit" and shots[1].emphasis == "normal"
+    # the tall panel stays up for shots 2-3: one scroll span, so it never jumps back to its top
+    assert shots[2].spans["tall"] == shots[3].spans["tall"] == [4.0, 9.0]
+    # a short beat adds two panels at once instead of one per step
+    short = build_shots([{"start": 0.0, "end": 2.0, "panels": ["a", "b", "c"], "emphasis": "normal"}], "motion")
+    assert [s.panels for s in short] == [["a", "b"]]
+    style = MotionStyle(1920, 1080, _panels(tmp_path), Look())
+    for pids in (["a", "b"], ["b", "tall"], ["a", "tall"]):
+        rs = list(style.layout(pids).values())
+        a, b = rs
+        assert a.x + a.w <= b.x + 1 or a.y + a.h <= b.y + 1  # side by side or stacked
+    # continuous camera: a shot starts at the zoom the previous one ended on
+    s0, s1 = shots[0], shots[1]
+    end0 = style._cam(s0, None, s0.dur)[0]
+    assert abs(style._cam(s1, s0, 0.0)[0] - end0) < 1e-3
+    # cards of the next shot wait for leaving cards to fade first
+    cur, prv = style.layout(["tall"]), style.layout(["a", "b"])
+    starts, _, _ = style._entries(cur, prv, 3.0)
+    assert starts["tall"] >= style.T_OUT * 0.8
 
 
 # ------------------------------------------------------------------ pipeline
@@ -745,7 +775,7 @@ def _script(n_chapters, words_per_beat=50, beats=6):
 def test_parts_split_whole_chapters_with_previously(tmp_path, monkeypatch):
     from recaper import pipeline
 
-    cfg = Config(episode_minutes=3.0, words_per_minute=200)  # each chapter = 300 words = 1.5 min
+    cfg = Config(episode_minutes=3.0, words_per_minute=200, tts=TTSConfig(speed=1.2))  # each chapter = 300 words = 1.5 min
     project = pipeline.Project(tmp_path, cfg)
     assert len(project.parts(_script(2))) == 1  # 3.25 min total: under the 1.25x slack
     model = _Fake("w", json.dumps({"beats": [{"text": "Previously, Jin entered the gate.", "panels": ["c0002-p005"]},
@@ -792,7 +822,7 @@ def test_usage_log_summary_and_estimate(tmp_path):
     assert llm["claude"]["billing"] in ("plan", "api") and runs[0]["images"]["ok"] == 1
 
     (tmp_path / "Ch 1").mkdir()
-    cfg = Config(minutes_per_chapter=2.0, episode_minutes=2.0)
+    cfg = Config(minutes_per_chapter=2.0, episode_minutes=2.0, tts=TTSConfig(speed=1.2))
     est = usage.estimate(tmp_path, cfg, [{"title": "Ch 1", "pages": 10}, {"title": "Ch 2", "pages": 10}], is_book=False)
     assert est["chapters"] == 2 and est["unread"] == 2 and est["reader"]["images"] == 60
     assert est["reader"]["calls"] == 2 * 1 and est["writer"]["calls"] == 2 * 2 + 1 + 1 + 1  # write+polish, bible, hook, previously
@@ -901,3 +931,103 @@ def test_gpu_frames_match_cpu(samples):
             cpu = cv2.cvtColor(st.frame(sh, prev, t), cv2.COLOR_BGR2YUV_I420).ravel()
             diff = np.abs(dev.to_i420(g).astype(int) - cpu.astype(int))
             assert diff.mean() < 1.0, (style_cls.name, k, diff.mean())
+
+
+def test_video_runs_queue_downloads_do_not(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    from recaper.web.jobs import JobManager
+
+    m = JobManager()
+    gates: dict[str, threading.Event] = {}
+
+    def fake_run(job, args, cwd):  # stands in for the recaper subprocess
+        gate = gates.setdefault(job.project, threading.Event())
+        gate.wait(10)
+        job.status, job.finished = "done", time.time()
+        m._pump()
+
+    monkeypatch.setattr(m, "_run_subprocess", fake_run)
+    a = m.run_pipeline("A", tmp_path, "render", [], False, None)
+    b = m.run_pipeline("B", tmp_path, "render", [], False, None)
+    c = m.run_pipeline("C", tmp_path, "render", [], False, None)
+    assert (a.status, b.status, c.status) == ("running", "queued", "queued")
+    assert (b.position, c.position) == (1, 2) and b.view()["position"] == 1
+    with pytest.raises(RuntimeError):
+        m.run_pipeline("B", tmp_path, "render", [], False, None)  # one per project
+    m.cancel(b.id)
+    assert b.status == "cancelled" and c.position == 1
+    started = threading.Event()
+    d = m.run_download("D", "download", lambda job: (started.set(), {"downloaded": 1})[1])
+    assert started.wait(5)  # downloads don't wait for the video queue
+    gates.setdefault("A", threading.Event()).set()
+    for _ in range(100):
+        if c.status == "running":
+            break
+        time.sleep(0.02)
+    assert a.status == "done" and c.status == "running" and c.position is None
+    gates.setdefault("C", threading.Event()).set()
+    for _ in range(100):
+        if c.status == "done" and d.status == "done":
+            break
+        time.sleep(0.02)
+    assert c.status == "done" and d.status == "done"
+
+
+def test_polisher_voices_look_preview_and_pace(samples, tmp_path):
+    import shutil as _sh
+
+    import cv2
+    from fastapi.testclient import TestClient
+
+    from recaper import usage
+    from recaper.config import TTSConfig as _T
+    from recaper.story import Bible, polish_chapter
+    from recaper.web import options as opts
+    from recaper.web.server import create_app
+
+    # polisher: its own chain, its own cache entry, its own estimate row
+    cfg = Config(polisher="claude:haiku", polish=True)
+    beats = [{"text": f"Gon runs number {i} far away now.", "panels": ["p"], "emphasis": "normal"} for i in range(3)]
+
+    class _Echo:
+        calls = 0
+
+        def complete_json(self, system, parts):
+            _Echo.calls += 1
+            return {"texts": [b["text"].replace("runs", "sprints") for b in beats]}
+
+    out = polish_chapter(beats, "Ch", Bible(), _Echo(), cfg, tmp_path / "pc")
+    assert out[0]["text"].startswith("Gon sprints") and _Echo.calls == 1
+    polish_chapter(beats, "Ch", Bible(), _Echo(), Config(polish=True), tmp_path / "pc")  # writer's own polish: separate cache
+    assert _Echo.calls == 2
+    _sh.copytree(samples / "manga", tmp_path / "Manga")
+    est = usage.estimate(tmp_path / "Manga", cfg, [{"title": "c", "pages": 4}] * 2, is_book=False)
+    assert est["polisher"]["calls"] == 2 and est["polisher"]["spec"] == "claude:haiku"
+    assert opts.write_values(tmp_path / "Manga", {"polisher": "claude:haiku"})["polisher"] == "claude:haiku"
+
+    # measured pace beats the nominal one, scaled to the current speed
+    work = tmp_path / "Manga" / ".recaper"
+    work.mkdir(exist_ok=True)
+    nominal = usage.pace(work, Config())
+    usage.save_pace(work, _T(engine="kokoro", speed=1.2), words=1620, seconds=600)  # 162 wpm at 1.2
+    assert abs(usage.pace(work, Config(tts=_T(engine="kokoro", speed=1.0))) - 135) < 0.5
+    assert usage.pace(work, Config(tts=_T(engine="edge", speed=1.0))) == Config(tts=_T(engine="edge", speed=1.0)).spoken_wpm
+    assert nominal == Config().spoken_wpm
+
+    c = TestClient(create_app(tmp_path))
+    v = c.get("/api/voices?engine=kokoro&lang=pt").json()
+    assert v["default"] == "pm_alex" and v["voices"][0]["match"] and v["voices"][0]["value"][0] == "p"
+    assert c.get("/api/voices?engine=edge&lang=en").json()["voices"][0]["value"].startswith("en-")
+    assert c.post("/api/voice-sample", json={"engine": "kokoro", "speed": 9}).status_code == 400
+    assert c.get("/api/voice-sample/..%2F..%2Fsecret.wav").status_code == 404
+    for style in ("motion", "blurfill", "auto"):
+        r = c.get(f"/api/projects/Manga/look-preview?style={style}&background=black&width=320")
+        assert r.status_code == 200 and r.headers["content-type"] == "image/jpeg"
+        img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
+        assert img.shape[1] == 320
+    assert c.get("/api/projects/Manga/look-preview?style=nope").status_code == 400
+    e = c.get("/api/projects/Manga/estimate?chapters=1").json()
+    assert e["chapters"] == 1
+    assert c.get("/api/projects/Manga/estimate?chapters=1;rm").status_code == 400

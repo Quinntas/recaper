@@ -40,7 +40,7 @@ class Look:
     """Every visual option (mirrors the look fields of RenderConfig)."""
 
     background: str = "paper"
-    layout: str = "cascade"
+    layout: str = "clean"
     reveal: str = "progressive"
     card_border: bool = True
     shadow: float = 1.0
@@ -111,6 +111,7 @@ class Shot:
     panels: list[str]
     emphasis: str = "normal"
     index: int = 0  # global shot index (used to alternate motion)
+    spans: dict | None = None  # pid -> [start, end] of that panel's continuous time on screen (scrolling)
 
     @property
     def dur(self) -> float:
@@ -151,6 +152,11 @@ def camera(emphasis: str, t: float, d: float, push: float = 1.0, hit: float = 1.
     return 1 + 0.03 * push * p, 0.0, 0.0
 
 
+def _q8(n: int) -> int:
+    """Shadow sprite height rounded to 8 px, so a resizing card doesn't build a new sprite every frame."""
+    return max(8, int(round(n / 8)) * 8)
+
+
 class _Base:
     def __init__(self, width: int, height: int, panels: dict[str, PanelInfo], look: Look | None = None):
         self.W, self.H = width, height
@@ -180,7 +186,7 @@ class _Base:
         Y = cy + (rect.y - cy) * s + dy
         sc = f * s
         tex = gpu.tex(img)
-        view_h = int(round(base.h))
+        view_h = min(bch, int(round(rect.h / max(f, 1e-6))))
         if bch > view_h + 1:  # scrolling card: crop rows on the device (the texture is uploaded once)
             off = (bch - view_h) * clamp01(scroll)
             oi = int(off)
@@ -188,7 +194,7 @@ class _Base:
             Y -= (off - oi) * sc
         shadow *= self.look.shadow
         if shadow > 0:
-            sprite, pad = self._shadow(tex.shape[3], min(tex.shape[2], view_h))
+            sprite, pad = self._shadow(tex.shape[3], _q8(min(tex.shape[2], view_h)))
             off_x, off_y = self.H * 0.008, self.H * 0.012
             gpu.shadow(canvas, gpu.tex(sprite), sc, X + (off_x - pad) * sc, Y + (off_y - pad) * sc, shadow * alpha)
         gpu.blit(canvas, tex, sc, X, Y, alpha)
@@ -215,7 +221,7 @@ class _Base:
         X = cx + (rect.x - cx) * s + dx
         Y = cy + (rect.y - cy) * s + dy
         sc = f * s
-        view_h = int(round(base.h))
+        view_h = min(bch, int(round(rect.h / max(f, 1e-6))))  # rows of the base image in view (== base.h at rest)
         if bch > view_h + 1:  # scrolling card
             off = (bch - view_h) * clamp01(scroll)
             oi = int(off)
@@ -223,7 +229,7 @@ class _Base:
             Y -= (off - oi) * sc
         shadow *= self.look.shadow
         if shadow > 0:
-            sprite, pad = self._shadow(img.shape[1], min(img.shape[0], view_h))
+            sprite, pad = self._shadow(img.shape[1], _q8(min(img.shape[0], view_h)))
             off_x, off_y = self.H * 0.008, self.H * 0.012
             blit_shadow(canvas, sprite, affine(sc, X + (off_x - pad) * sc, Y + (off_y - pad) * sc), shadow * alpha)
         if image:
@@ -244,18 +250,21 @@ class MotionStyle(_Base):
             self.border_color = (215, 215, 215)  # light hairline reads better on dark/blurred backgrounds
         fill = min(max(lk.fill, 0.5), 1.0)
         self.mx, self.my, self.gap = width * (1 - fill) / 2, height * ((1 - fill) / 2 + 0.01), width * 0.019
-        self.T_IN, self.T_MOVE, self.T_OUT, self.STAGGER = (x / self.speed for x in (0.5, 0.45, 0.35, 0.12))
-        # Multi-panel beats cascade (each panel big, newest on top) like the reference motion-comic
-        # recaps; side-by-side rows shrink panels and leave half-empty frames during progressive reveal.
-        self.cascade = lk.layout != "row"
+        self.T_IN, self.T_MOVE, self.T_OUT, self.STAGGER = (x / self.speed for x in (0.5, 0.45, 0.3, 0.12))
+        # clean   - at most two panels at once, side by side or stacked, never overlapping (build_shots splits
+        #           multi-panel beats into steps: [A] -> [A, B] -> [B, C])
+        # cascade - every panel of the beat big and overlapping, newest on top
+        # row     - every panel of the beat side by side
+        self.mode = lk.layout if lk.layout in ("clean", "cascade", "row") else "clean"
         self._blur_bg = lru_cache(maxsize=6)(
             lambda pid: blurred_cover(self._full(pid), self.W, self.H, overscan=1.0, blur=lk.bg_blur, dim=lk.bg_dim)
         )
         self._layout = lru_cache(maxsize=64)(self._compute_layout)
         self._settled = lru_cache(maxsize=4)(self._settled_layer)
+        self._live = lru_cache(maxsize=64)(self._live_from)
 
     def layout(self, pids: list[str]) -> dict[str, Rect]:
-        return self._layout(tuple(pids))
+        return self._layout(tuple(dict.fromkeys(pids)))
 
     def _compute_layout(self, pids: tuple[str, ...]) -> dict[str, Rect]:
         aw, ah = self.W - 2 * self.mx, self.H - 2 * self.my
@@ -277,10 +286,8 @@ class MotionStyle(_Base):
         col_w = min(aw, (ah - self.gap * (k - 1)) / sum(1 / a for a in ars))
         col_area = sum(col_w * col_w / a for a in ars)
         out: dict[str, Rect] = {}
-        if self.cascade or max(row_area, col_area) / k < 0.40 * aw * ah:
-            # Side by side would make every panel small. Cascade instead (like the reference
-            # motion-comic recaps): each panel near full size, overlapping the previous one with an
-            # offset, newest on top - shown progressively as the narration reaches it.
+        if self.mode == "cascade" or (self.mode == "row" and max(row_area, col_area) / k < 0.40 * aw * ah):
+            # each panel near full size, overlapping the previous one with an offset, newest on top
             for j, (pid, info, a) in enumerate(zip(pids, infos, ars)):
                 dw = min(aw * 0.86, ah * 0.94 * a, info.w * self.look.max_upscale)
                 if a < 0.8:  # tall: wider + scrolling rather than a thin column
@@ -313,123 +320,129 @@ class MotionStyle(_Base):
             return self.bg
         return self._blur_bg(pids[0])
 
+    def _live_from(self, pids: tuple[str, ...]) -> int:
+        """Index of the first card drawn every frame once settled: the first scrolling card and everything
+        stacked above it (baking the cards above into the cached layer would put the scrolling one on top)."""
+        lay = list(self.layout(list(pids)).values())
+        return next((i for i, r in enumerate(lay) if r.content_h > r.h + 1), len(lay))
+
     def _settled_layer(self, pids: tuple[str, ...]) -> np.ndarray:
-        """Background + shadows + non-scrolling cards at rest (camera at identity)."""
+        """Background + shadows + the static cards at rest (camera at identity)."""
         canvas = self.background(pids).copy()
         ident = (1.0, 0.0, 0.0)
-        for pid, r in self.layout(list(pids)).items():
-            scrolling = r.content_h > r.h + 1
-            # scrolling cards: shadow only here, their content is drawn per frame
-            self.draw_card(canvas, pid, r, r, 1.0, ident, 0.0, border=self.look.card_border, shadow=0.35, image=not scrolling)
+        for pid, r in list(self.layout(list(pids)).items())[: self._live(pids)]:
+            self.draw_card(canvas, pid, r, r, 1.0, ident, 0.0, border=self.look.card_border, shadow=0.35)
         return canvas
 
-    def _entries(self, cur: dict, prv: dict, dur: float) -> tuple[dict[str, float], float]:
-        """When each new card starts entering, and when the shot settles.
+    def _push(self, shot: Shot) -> float:
+        """Camera zoom a shot ends at: even shots push in, odd ones ease back out, so the camera never jumps."""
+        if shot.index % 2:
+            return 1.0
+        return 1 + (0.07 if shot.emphasis == "reveal" else 0.03) * self.look.camera
 
-        New cards of a beat are revealed progressively across the beat (like the narration moves
-        through them) instead of all at once - the reference recaps change something on screen
-        every few seconds."""
+    def _cam(self, shot: Shot, prev: Shot | None, t: float) -> tuple[float, float, float]:
+        p = ease_in_out_sine(clamp01(t / max(shot.dur, 1e-3)))
+        s0 = self._push(prev) if prev is not None and abs(prev.end - shot.start) < 0.05 else 1.0
+        s = lerp(s0, self._push(shot), p)
+        hit = self.look.hit_effect
+        if shot.emphasis == "hit" and hit > 0:
+            punch = 0.07 * hit * math.exp(-t / 0.16)
+            decay = hit * math.exp(-t / 0.12)
+            return s + punch, 10 * decay * math.sin(t * 70), 7 * decay * math.cos(t * 55)
+        return s, 0.0, 0.0
+
+    @staticmethod
+    def _scroll(shot: Shot, pid: str, t: float) -> float:
+        """Scroll of a tall card over its whole time on screen (it may stay up across several shots)."""
+        a, b = (shot.spans or {}).get(pid) or (shot.start, shot.end)
+        return ease_in_out_sine(clamp01((shot.start + t - a - 0.3) / max(b - a - 0.5, 0.5)))
+
+    def _entries(self, cur: dict, prv: dict, dur: float) -> tuple[dict[str, float], float, float]:
+        """When each new card starts entering, when the shot settles, and when kept cards start moving.
+
+        Leaving cards fade out first, kept cards then glide to their new spot, and new cards come in last, so
+        nothing appears or vanishes behind another card."""
         new = [p for p in cur if p not in prv]
         leaving = any(p not in cur for p in prv)
-        delay = self.T_OUT * 0.45 if leaving else 0.0
-        progressive = self.look.reveal != "together"
+        moved = any(p in prv and prv[p] != r for p, r in cur.items())
+        mdelay = self.T_OUT * 0.5 if leaving and moved else 0.0
+        delay = self.T_OUT * 0.8 if leaving else 0.0
+        if moved:
+            delay = max(delay, mdelay + self.T_MOVE * 0.7)  # kept cards are mostly in place before new ones enter
+        progressive = self.look.reveal != "together" and self.mode != "clean"  # clean: build_shots makes the steps
         spacing = (max(self.STAGGER, 0.8 * dur / max(len(new), 1)) if progressive else self.STAGGER) if len(new) > 1 else 0.0
         starts = {pid: delay + j * spacing for j, pid in enumerate(new)}
-        settle = max(self.T_MOVE if prv else 0.0, self.T_OUT if leaving else 0.0)
+        settle = max(mdelay + self.T_MOVE if moved else 0.0, self.T_OUT if leaving else 0.0)
         if new:
             settle = max(settle, max(starts.values()) + self.T_IN)
-        return starts, settle
+        return starts, settle, mdelay
+
+    def _ops(self, shot: Shot, prev: Shot | None, t: float, cur: dict, prv: dict, starts: dict, mdelay: float) -> list[tuple]:
+        """Cards of a changing frame, bottom to top: (pid, base, rect, alpha, scroll, shadow)."""
+        slide = self.W * 0.38
+        ops = []
+        p = ease_in_out_cubic(clamp01(t / self.T_OUT))
+        for pid, r in prv.items():  # leaving: quick shrink + fade in place
+            if pid in cur or p >= 1:
+                continue
+            k = 1 - 0.08 * p
+            moved = Rect(r.x + r.w * (1 - k) / 2 - self.W * 0.03 * p, r.y + r.h * (1 - k) / 2, r.w * k, r.h * k, r.content_h * k)
+            ops.append((pid, r, moved, 1 - p, self._scroll(prev, pid, prev.dur), 0.35 * (1 - p)))
+        for pid, r in cur.items():
+            if pid in prv:  # kept: glide (and resize) to the new spot; drawn from the larger of the two sizes
+                q = ease_in_out_cubic(clamp01((t - mdelay) / self.T_MOVE))
+                base = prv[pid] if prv[pid].w > r.w else r
+                ops.append((pid, base, prv[pid].lerp(r, q), 1.0, self._scroll(shot, pid, t), 0.35))
+                continue
+            q = (t - starts[pid]) / self.T_IN
+            if q <= 0:
+                continue
+            e = ease_out_back(q)
+            moved = Rect(r.x + slide * (1 - e), r.y, r.w, r.h, r.content_h)
+            ops.append((pid, r, moved, clamp01(q * 2.5), self._scroll(shot, pid, t), 0.35))
+        return ops
 
     def frame(self, shot: Shot, prev: Shot | None, t: float) -> np.ndarray:
         cur = self.layout(shot.panels)
         prv = self.layout(prev.panels) if prev else {}
-        cam = camera(shot.emphasis, t, shot.dur, self.look.camera, self.look.hit_effect)
-        scroll = ease_in_out_sine(clamp01((t - 0.3) / max(shot.dur - 0.5, 0.5)))
-        starts, settle = self._entries(cur, prv, shot.dur)
-
+        cam = self._cam(shot, prev, t)
+        starts, settle, mdelay = self._entries(cur, prv, shot.dur)
+        border = self.look.card_border
         if t >= settle:
             # steady state: one cached composition, camera applied as a single whole-frame warp
             # (frame_gpu does the same on the GPU)
-            frame = warp_frame(self._settled(tuple(shot.panels)), *cam)
-            for pid, r in cur.items():
-                if r.content_h > r.h + 1:
-                    self.draw_card(frame, pid, r, r, 1.0, cam, scroll, border=self.look.card_border, shadow=0.0)
+            key = tuple(cur)
+            frame = warp_frame(self._settled(key), *cam)
+            for pid, r in list(cur.items())[self._live(key) :]:
+                self.draw_card(frame, pid, r, r, 1.0, cam, self._scroll(shot, pid, t), border=border, shadow=0.35)
             return frame
-
-        return self._transition(shot, prev, t, cur, prv, cam, scroll, starts)
-
-    def frame_gpu(self, gpu, shot: Shot, prev: Shot | None, t: float):
-        """Every motion frame on the GPU: settled = warp of the cached layer, transitions = cards composed on device."""
-        cur = self.layout(shot.panels)
-        prv = self.layout(prev.panels) if prev else {}
-        starts, settle = self._entries(cur, prv, shot.dur)
-        cam = camera(shot.emphasis, t, shot.dur, self.look.camera, self.look.hit_effect)
-        scroll = ease_in_out_sine(clamp01((t - 0.3) / max(shot.dur - 0.5, 0.5)))
-        if t < settle:
-            return self._transition_gpu(gpu, shot, prev, t, cur, prv, cam, scroll, starts)
-        frame = gpu.warp(self._settled(tuple(shot.panels)), *cam)
-        for pid, r in cur.items():
-            if r.content_h > r.h + 1:
-                self.card_gpu(gpu, frame, pid, r, r, 1.0, cam, scroll, border=self.look.card_border)
-        return frame
-
-    def _transition_gpu(self, gpu, shot: Shot, prev: Shot | None, t: float, cur: dict, prv: dict, cam, scroll: float, starts: dict):
-        """_transition on the GPU (keep the two in step)."""
-        slide = self.W * 0.38
-        canvas = gpu.tex(self.background(shot.panels)).clone()
-        if self.bg is None and prev is not None and prev.panels[0] != shot.panels[0]:
-            canvas = gpu.blend(canvas, gpu.tex(self.background(prev.panels)), clamp01(t / self.T_OUT))
-        border = self.look.card_border
-        for pid, r in prv.items():
-            if pid in cur:
-                continue
-            p = ease_in_out_cubic(t / self.T_OUT)
-            if p >= 1:
-                continue
-            k = 1 - 0.08 * p
-            moved = Rect(r.x + r.w * (1 - k) / 2 - self.W * 0.03 * p, r.y + r.h * (1 - k) / 2, r.w * k, r.h * k, r.content_h * k)
-            self.card_gpu(gpu, canvas, pid, r, moved, 1 - p, cam, 1.0, border, shadow=0.35 * (1 - p))
-        for pid, r in cur.items():
-            if pid in prv:
-                q = ease_in_out_cubic(t / self.T_MOVE)
-                self.card_gpu(gpu, canvas, pid, r, prv[pid].lerp(r, q), 1.0, cam, scroll, border, shadow=0.35)
-                continue
-            q = (t - starts[pid]) / self.T_IN
-            if q <= 0:
-                continue
-            e = ease_out_back(q)
-            moved = Rect(r.x + slide * (1 - e), r.y, r.w, r.h, r.content_h)
-            self.card_gpu(gpu, canvas, pid, r, moved, clamp01(q * 2.5), cam, scroll, border, shadow=0.35)
-        return canvas
-
-    def _transition(self, shot: Shot, prev: Shot | None, t: float, cur: dict, prv: dict, cam, scroll: float, starts: dict) -> np.ndarray:
-        slide = self.W * 0.38
-        canvas = self.background(shot.panels).copy()
+        # the background moves with the same camera as the settled frames, so nothing jumps when they take over
+        canvas = warp_frame(self.background(shot.panels), *cam)
         if self.bg is None and prev is not None and prev.panels[0] != shot.panels[0]:
             q = clamp01(t / self.T_OUT)  # blurred backgrounds cross-fade between beats
-            canvas = cv2.addWeighted(canvas, q, self.background(prev.panels), 1 - q, 0)
+            canvas = cv2.addWeighted(canvas, q, warp_frame(self.background(prev.panels), *cam), 1 - q, 0)
+        for pid, base, rect, alpha, scroll, shadow in self._ops(shot, prev, t, cur, prv, starts, mdelay):
+            self.draw_card(canvas, pid, base, rect, alpha, cam, scroll, border=border, shadow=shadow)
+        return canvas
 
-        for pid, r in prv.items():  # leaving: quick shrink + fade in place (sliding would cross the new card)
-            if pid in cur:
-                continue
-            p = ease_in_out_cubic(t / self.T_OUT)
-            if p >= 1:
-                continue
-            k = 1 - 0.08 * p
-            moved = Rect(r.x + r.w * (1 - k) / 2 - self.W * 0.03 * p, r.y + r.h * (1 - k) / 2, r.w * k, r.h * k, r.content_h * k)
-            self.draw_card(canvas, pid, r, moved, 1 - p, cam, 1.0, border=self.look.card_border, shadow=0.35 * (1 - p))
-
-        for pid, r in cur.items():
-            if pid in prv:
-                q = ease_in_out_cubic(t / self.T_MOVE)
-                self.draw_card(canvas, pid, r, prv[pid].lerp(r, q), 1.0, cam, scroll, border=self.look.card_border, shadow=0.35)
-                continue
-            q = (t - starts[pid]) / self.T_IN
-            if q <= 0:
-                continue
-            e = ease_out_back(q)
-            moved = Rect(r.x + slide * (1 - e), r.y, r.w, r.h, r.content_h)
-            self.draw_card(canvas, pid, r, moved, clamp01(q * 2.5), cam, scroll, border=self.look.card_border, shadow=0.35)
+    def frame_gpu(self, gpu, shot: Shot, prev: Shot | None, t: float):
+        """frame() on the GPU (keep the two in step)."""
+        cur = self.layout(shot.panels)
+        prv = self.layout(prev.panels) if prev else {}
+        cam = self._cam(shot, prev, t)
+        starts, settle, mdelay = self._entries(cur, prv, shot.dur)
+        border = self.look.card_border
+        if t >= settle:
+            key = tuple(cur)
+            frame = gpu.warp(self._settled(key), *cam)
+            for pid, r in list(cur.items())[self._live(key) :]:
+                self.card_gpu(gpu, frame, pid, r, r, 1.0, cam, self._scroll(shot, pid, t), border, shadow=0.35)
+            return frame
+        canvas = gpu.warp(self.background(shot.panels), *cam)
+        if self.bg is None and prev is not None and prev.panels[0] != shot.panels[0]:
+            canvas = gpu.blend(canvas, gpu.warp(self.background(prev.panels), *cam), clamp01(t / self.T_OUT))
+        for pid, base, rect, alpha, scroll, shadow in self._ops(shot, prev, t, cur, prv, starts, mdelay):
+            self.card_gpu(gpu, canvas, pid, base, rect, alpha, cam, scroll, border, shadow=shadow)
         return canvas
 
 
@@ -524,10 +537,37 @@ def make_style(name: str, width: int, height: int, panels: dict[str, PanelInfo],
     raise ValueError(f"unknown style {name!r} (motion | blurfill)")
 
 
-def build_shots(timed_beats: list[dict], style: str, min_shot: float = 1.1) -> list[Shot]:
+def _steps(pids: list[str], d: float, min_step: float) -> list[list[str]]:
+    """Clean motion layout: reveal a beat's panels one step at a time, at most two on screen.
+
+    [A, B, C] -> [A], [A, B], [B, C]. A beat too short for one step per panel adds two at once (and drops
+    panels it has no time for, like blurfill)."""
+    steps = max(1, min(len(pids), int(d // min_step)))
+    pids = pids[: 2 * steps]
+    sizes = [len(pids) // steps + (1 if i < len(pids) % steps else 0) for i in range(steps)]
+    out: list[list[str]] = []
+    k = 0
+    for n in sizes:
+        group = pids[k : k + n]
+        k += n
+        out.append(group if n >= 2 or not out else out[-1][-1:] + group)
+    return out
+
+
+def build_shots(timed_beats: list[dict], style: str, min_shot: float = 1.1, look: Look | None = None) -> list[Shot]:
     """timed_beats: [{start, end, panels, emphasis}] -> shots for the given style."""
+    look = look or Look()
+    clean = look.layout not in ("cascade", "row") and look.reveal != "together"
     shots: list[Shot] = []
     for b in timed_beats:
+        pids = list(dict.fromkeys(b["panels"]))
+        if style == "motion" and clean and len(pids) > 1:
+            steps = _steps(pids, b["end"] - b["start"], 1.4)
+            step = (b["end"] - b["start"]) / len(steps)
+            for i, vis in enumerate(steps):
+                emph = b["emphasis"] if i == 0 else ("normal" if b["emphasis"] == "hit" else b["emphasis"])
+                shots.append(Shot(b["start"] + i * step, b["start"] + (i + 1) * step, vis, emph))
+            continue
         if style == "motion" or len(b["panels"]) == 1:
             shots.append(Shot(b["start"], b["end"], list(b["panels"]), b["emphasis"]))
             continue
@@ -539,6 +579,16 @@ def build_shots(timed_beats: list[dict], style: str, min_shot: float = 1.1) -> l
             shots.append(Shot(b["start"] + i * step, b["start"] + (i + 1) * step, [pid], emph))
     for i, s in enumerate(shots):
         s.index = i
+    # each panel's continuous time on screen, so a tall card kept across shots keeps scrolling instead of
+    # jumping back to its top
+    for i, s in enumerate(shots):
+        before = shots[i - 1].spans if i else {}
+        s.spans = {p: [before[p][0] if p in before else s.start, s.end] for p in s.panels}
+    for i in range(len(shots) - 2, -1, -1):
+        after = shots[i + 1].spans
+        for p, span in shots[i].spans.items():
+            if p in after:
+                span[1] = after[p][1]
     return shots
 
 

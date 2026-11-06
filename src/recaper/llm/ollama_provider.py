@@ -1,6 +1,7 @@
 """Local models through Ollama (OLLAMA_HOST, default http://localhost:11434)."""
 
 from __future__ import annotations
+import os
 
 from typing import Sequence
 
@@ -43,7 +44,11 @@ class OllamaProvider(Provider):
                     {"role": "user", "content": "\n".join(text), **({"images": images} if images else {})},
                 ],
                 format="json",
-                options={"num_ctx": 32768},
+                options={
+                    "num_ctx": int(os.environ.get("OLLAMA_NUM_CTX", "65536")),
+                    "num_predict": int(os.environ.get("OLLAMA_NUM_PREDICT", "4096")),
+                    "temperature": 0.2,
+                },
             )
         except Exception as e:  # noqa: BLE001
             raise ProviderError(str(e)) from e
