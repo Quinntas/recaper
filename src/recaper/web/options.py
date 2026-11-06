@@ -95,6 +95,9 @@ META: dict[str, tuple] = {
     "extra_instructions": ("story", "Extra directions for the writer", "Tone, nicknames, things to emphasise or skip.", "textarea", None, None),
     "hook": ("story", "Cold-open hook", "Start the video with a 20-35 s hook built from the most striking moments.", "bool", None, None),
     "hook_words": ("story", "Hook length (words)", "Target length of the hook (hard cap +20%).", "int", None, None),
+    "polish": ("story", "Polish pass", "One extra writer call per chapter that line-edits the script: fixes present-tense \"tells/asks\", repeated openers and phrases, too few turns, over-long sentences and names that drift from the bible. Panels stay the same.", "bool", None, None),
+    "episode_minutes": ("story", "Split into parts (minutes)", "Long recaps become several videos of about this length (whole chapters, _part01.mp4, _part02.mp4…). 0 = one video.", "number", None, None),
+    "previously": ("story", "'Previously on' intro", "Parts 2+ open with a ~25 s recap of the story so far instead of the hook.", "bool", None, None),
     "outro": ("story", "Closing line", "Optional last line, voiced over the final panel (e.g. a call to action).", "text", None, None),
     "source": ("story", "Source type", "auto detects light novels / books (EPUB, text PDF, TXT), long colour strips (manhwa) and pages (manga).", "select", ["auto", "manga", "manhwa", "book"], None),
     "reading": ("story", "Manga reading order", "Panel order on manga pages. auto = right-to-left for manga.", "select", ["auto", "rtl", "ltr"], None),
@@ -113,7 +116,7 @@ META: dict[str, tuple] = {
     "render.style": ("video", "Visual style", "motion = panel cards on paper, revealed with the narration (manga default). blurfill = panel over blurred copy (manhwa default).", "select", ["auto", "motion", "blurfill"], None),
     "render.width": ("video", "Width", "", "int", None, None),
     "render.height": ("video", "Height", "", "int", None, None),
-    "render.fps": ("video", "FPS", "", "int", None, None),
+    "render.fps": ("video", "FPS", "Frames per second.", "int", None, None),
     "render.quality": ("video", "Quality (CQ/CRF)", "Lower = better & bigger. 18-23 is typical.", "int", None, None),
     "render.loudness": ("video", "Loudness (LUFS)", "Integrated loudness of the final mix. YouTube normalises to -14.", "number", None, None),
     "render.background": ("look", "Background (motion style)", "paper, black, white, dark, blur (blurred current panel) or any #rrggbb colour.", "color", BACKGROUNDS, None),
@@ -126,6 +129,7 @@ META: dict[str, tuple] = {
     "render.transition_speed": ("look", "Animation speed", "Card slides and cross-dissolves. >1 = snappier, <1 = slower.", "number", None, None),
     "render.fill": ("look", "Frame fill", "Share of the frame panels may use (0.5-1.0).", "number", None, None),
     "render.max_upscale": ("look", "Max upscale", "How much small panels may be enlarged. Higher = bigger but softer.", "number", None, None),
+    "render.upscaler": ("look", "Panel upscaler", "Real-ESRGAN (anime) sharpens panels that are shown enlarged, so they can fill the frame without going soft. Runs on the GPU, once per panel (cached). auto = fast on a CUDA GPU, off otherwise.", "select", ["auto", "fast", "quality", "off"], None),
     "render.bg_blur": ("look", "Background blur", "Blur strength for blurfill and the 'blur' background.", "number", None, None),
     "render.bg_dim": ("look", "Background brightness", "0 = black, 1 = full brightness (blurred backgrounds).", "number", None, None),
     "panels.gutter": ("panels", "Manhwa gutter size", "Min blank gap between panels, as a fraction of strip width. Lower = more, smaller cuts. Changing re-cuts and re-reads the chapter.", "number", None, None),
@@ -133,7 +137,7 @@ META: dict[str, tuple] = {
     "panels.max_ratio": ("panels", "Manhwa max panel ratio", "Panels taller than width x this are split.", "number", None, None),
     "panels.white": ("panels", "Manga background level", "Brightness (0-255) above which a pixel counts as page background. Lower if gutters are grey.", "int", None, None),
     "image_sources": ("book", "Related works (image sources)", "Library projects - e.g. the manga adaptation - whose panels illustrate this one. Comma-separated. Use the Images tab to find and link them.", "projects", None, None),
-    "images.generator": ("book", "Image generator", "Fills beats no real image fits, styled on the official art. gemini needs GEMINI_API_KEY, openai needs OPENAI_API_KEY. none = reuse the nearest real image.", "provider", None, ["none", "gemini", "gemini:gemini-2.5-flash-image", "openai", "openai:gpt-image-1"]),
+    "images.generator": ("book", "Image generator", "Fills beats no real image fits, styled on the official art. antigravity uses your Google AI plan (no key, ~1 min per image; style matches well, faces less exactly). gemini needs GEMINI_API_KEY, openai needs OPENAI_API_KEY. none = reuse the nearest real image.", "provider", None, ["none", "antigravity", "gemini", "gemini:gemini-2.5-flash-image", "openai", "openai:gpt-image-1"]),
     "images.style": ("book", "Generated image style", "Style words added to every generation prompt.", "textarea", None, None),
     "images.max_generated": ("book", "Max generated images", "Per video (cost control). Beyond it the nearest real image is reused.", "int", None, None),
     "images.refs": ("book", "Reference images per generation", "Official art sent with each request so characters and style match.", "int", None, None),
@@ -144,6 +148,101 @@ META: dict[str, tuple] = {
     "render.chunk_seconds": ("advanced", "Render chunk length (s)", "Work-unit size for parallel rendering and the render cache.", "number", None, None),
     "render.encoder": ("advanced", "Encoder", "auto uses NVENC when available.", "select", ["auto", "nvenc", "x264"], None),
     "render.workers": ("advanced", "Render workers", "0 = auto.", "int", None, None),
+}
+
+
+# ---------------------------------------------------------------- UI widgets
+# Extra hints for the options editor (merged into the schema as "ui"):
+#   labels  {value: label} for select choices     groups  [{label, options: [[value, label]]}] grouped choices
+#   custom  allow a value that is not in the list  range   [min, max, step] -> slider + number box
+#   zero    label for 0 on a slider (e.g. "auto")   multi   multi-select (comma-separated value)
+LANG_LABELS = {"en": "English", "pt": "Portuguese (Brazil)", "es": "Spanish", "fr": "French", "it": "Italian",
+               "de": "German", "ja": "Japanese", "hi": "Hindi", "zh": "Chinese"}  # fmt: skip
+ENGINE_LABELS = {
+    "kokoro": "Kokoro - local GPU, fast (recommended)", "edge": "Edge - free online Microsoft voices",
+    "coqui": "Coqui XTTS - local GPU, voice cloning", "xtts": "XTTS (same as Coqui)", "piper": "Piper - local CPU",
+    "orpheus": "Orpheus - local GPU", "chatterbox": "Chatterbox - local GPU", "system": "System voice - offline",
+    "gtts": "Google Translate TTS - free online", "openai": "OpenAI TTS - API key", "elevenlabs": "ElevenLabs - API key",
+    "azure": "Azure Speech - API key", "cartesia": "Cartesia - API key", "minimax": "MiniMax - API key",
+    "qwen": "Qwen TTS",
+}  # fmt: skip
+_KOKORO_LANG = {"a": "American English", "b": "British English", "p": "Portuguese", "e": "Spanish", "f": "French",
+                "i": "Italian", "h": "Hindi", "j": "Japanese", "z": "Chinese"}  # fmt: skip
+
+
+def _voice_groups() -> list[dict]:
+    groups: dict[str, list] = {}
+    for v in KOKORO_VOICES:
+        lang = _KOKORO_LANG.get(v[0], v[:1])
+        sex = "male" if v[1] == "m" else "female"
+        groups.setdefault(f"Kokoro · {lang}", []).append([v, f"{v.split('_', 1)[1].title()} ({sex})"])
+    for engine, by_lang in DEFAULT_VOICES.items():
+        if engine == "kokoro":
+            continue
+        seen = sorted({v for v in by_lang.values()})
+        groups[f"{engine.title()} (narrator defaults)"] = [[v, v] for v in seen]
+    return [{"label": g, "options": o} for g, o in groups.items()]
+
+
+def _sizes(values: list[int], names: dict[int, str]) -> dict:
+    return {"labels": {str(v): f"{v} ({names[v]})" if v in names else str(v) for v in values}, "custom": True}
+
+
+UI: dict[str, dict] = {
+    "lang": {"labels": LANG_LABELS, "custom": True},
+    "minutes_per_chapter": {"range": [0.5, 6, 0.1]},
+    "hook_words": {"range": [40, 250, 5]},
+    "episode_minutes": {"range": [0, 60, 1], "zero": "one video"},
+    "render.upscaler": {"labels": {"auto": "Auto (fast on a CUDA GPU)", "fast": "Fast - natural look, ~0.1 s per panel",
+                                   "quality": "Quality - crisper lines, can over-sharpen", "off": "Off"}},
+    "source": {"labels": {"auto": "Auto-detect", "manga": "Manga (pages)", "manhwa": "Manhwa / webtoon (long strips)",
+                          "book": "Book / light novel (prose)"}},  # fmt: skip
+    "reading": {"labels": {"auto": "Auto (right-to-left for manga)", "rtl": "Right-to-left (Japanese)", "ltr": "Left-to-right"}},
+    "jobs": {"range": [1, 16, 1]},
+    "read_batch": {"range": [4, 60, 1]},
+    "words_per_minute": {"range": [140, 260, 5]},
+    "tts.engine": {"labels": ENGINE_LABELS, "custom": True},
+    "tts.voice": {"groups": _voice_groups(), "custom": True},
+    "tts.speed": {"range": [0.6, 2.0, 0.05]},
+    "tts.beat_gap": {"range": [0, 1, 0.02]},
+    "tts.chapter_gap": {"range": [0, 3, 0.05]},
+    "tts.workers": {"range": [0, 8, 1], "zero": "auto"},
+    "render.style": {"labels": {"auto": "Auto (motion for manga, blurfill for manhwa)", "motion": "Motion - panel cards revealed with the narration",
+                                "blurfill": "Blurfill - full panel over a blurred copy"}},  # fmt: skip
+    "render.width": _sizes([1280, 1920, 2560, 3840, 1080], {1280: "720p", 1920: "1080p", 2560: "1440p", 3840: "4K", 1080: "vertical / Shorts"}),
+    "render.height": _sizes([720, 1080, 1440, 2160, 1920], {720: "720p", 1080: "1080p", 1440: "1440p", 2160: "4K", 1920: "vertical / Shorts"}),
+    "render.fps": {"labels": {str(v): f"{v} fps" for v in (24, 25, 30, 50, 60)}, "custom": True},
+    "render.quality": {"range": [14, 35, 1]},
+    "render.loudness": {"range": [-24, -9, 0.5]},
+    "render.layout": {"labels": {"cascade": "Cascade - big, overlapping, newest on top", "row": "Row - side by side"}},
+    "render.reveal": {"labels": {"progressive": "Progressive - as the narration reaches them", "together": "Together - all at the start"}},
+    "render.shadow": {"range": [0, 2, 0.05]},
+    "render.camera": {"range": [0, 2, 0.05]},
+    "render.hit_effect": {"range": [0, 2, 0.05]},
+    "render.transition_speed": {"range": [0.25, 3, 0.05]},
+    "render.fill": {"range": [0.5, 1, 0.01]},
+    "render.max_upscale": {"range": [1, 4, 0.1]},
+    "render.bg_blur": {"range": [0, 30, 1]},
+    "render.bg_dim": {"range": [0, 1, 0.02]},
+    "panels.gutter": {"range": [0.005, 0.1, 0.001]},
+    "panels.min_height": {"range": [0.02, 0.5, 0.01]},
+    "panels.max_ratio": {"range": [1.5, 10, 0.1]},
+    "panels.white": {"range": [120, 255, 1]},
+    "image_sources": {"multi": True},
+    "images.generator": {"labels": {"none": "Off - reuse the nearest real image", "antigravity": "Antigravity - your Google AI plan, no key",
+                                    "gemini": "Gemini (GEMINI_API_KEY)",
+                                    "gemini:gemini-2.5-flash-image": "Gemini 2.5 Flash Image (GEMINI_API_KEY)",
+                                    "openai": "OpenAI (OPENAI_API_KEY)", "openai:gpt-image-1": "OpenAI gpt-image-1 (OPENAI_API_KEY)"},
+                         "custom": True},  # fmt: skip
+    "images.max_generated": {"range": [0, 200, 1]},
+    "images.refs": {"range": [0, 8, 1]},
+    "images.related_per_chapter": {"range": [10, 200, 5]},
+    "book.split_words": {"range": [1000, 20000, 250]},
+    "book.min_words": {"range": [0, 1000, 10]},
+    "book.min_illustration": {"range": [50, 1200, 10]},
+    "render.chunk_seconds": {"range": [5, 120, 1]},
+    "render.encoder": {"labels": {"auto": "Auto (NVENC when available)", "nvenc": "NVENC (NVIDIA GPU)", "x264": "x264 (CPU)"}},
+    "render.workers": {"range": [0, 16, 1], "zero": "auto"},
 }
 
 
@@ -168,9 +267,14 @@ def schema() -> dict:
     opts = []
     for key, default in _flat_fields():
         group, label, help_, kind, choices, suggestions = META.get(key, ("advanced", key, "", "text", None, None))
+        ui = dict(UI.get(key, {}))
+        if kind in ("provider", "int", "number", "select") and "labels" in ui:  # a choice list: render as a dropdown
+            listed = [c for c in ui["labels"] if not choices or c in choices]  # labelled (curated) order first
+            choices = listed + [c for c in (choices or []) if c not in listed]
+            kind = "select" if kind == "provider" else kind
         opts.append(
             {"key": key, "group": group, "label": label, "help": help_, "kind": kind, "default": default,
-             "choices": choices, "suggestions": suggestions}
+             "choices": choices, "suggestions": suggestions, "ui": ui}
         )  # fmt: skip
     missing = [k for k, _ in _flat_fields() if k not in META]
     return {"groups": [{"id": g, "label": label} for g, label in GROUPS], "options": opts,

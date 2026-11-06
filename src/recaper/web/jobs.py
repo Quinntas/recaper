@@ -86,15 +86,23 @@ class JobManager:
         return job
 
     # ------------------------------------------------------------- pipeline
-    def run_pipeline(self, project: str, project_dir: Path, until: str, force: list[str], preview: bool, output: str | None) -> Job:
+    def run_pipeline(self, project: str, project_dir: Path, until: str, force: list[str], preview: bool, output: str | None,
+                     quick: bool = False, chapters: str | None = None) -> Job:
         if self.active_for(project):
             raise RuntimeError("this project already has a running job")
-        job = self._new("pipeline", project, f"Make video ({until})" if until != "render" else "Make video")
+        title = "Quick preview" if quick else (f"Make video ({until})" if until != "render" else "Make video")
+        if chapters:
+            title += f" · ch {chapters}"
+        job = self._new("pipeline", project, title)
         args = [sys.executable, "-m", "recaper", "run", str(project_dir), "--until", until]
         for f in force:
             args += ["--force", f]
         if preview:
             args.append("--preview")
+        if quick:
+            args.append("--quick")
+        if chapters:
+            args += ["--chapters", chapters]
         if output:
             args += ["--out", str(project_dir / output)]
         threading.Thread(target=self._run_subprocess, args=(job, args, project_dir), daemon=True).start()
@@ -136,6 +144,7 @@ class JobManager:
             stage = ev.get("stage")
             if stage == "done":
                 job.result["output"] = ev.get("output")
+                job.result.setdefault("outputs", []).append(ev.get("output"))
                 return
             job.current = stage
             job.stages[stage] = {"done": ev.get("done"), "total": ev.get("total"), "msg": ev.get("msg")}

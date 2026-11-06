@@ -204,3 +204,35 @@ video { width: 100%; border-radius: 10px; background: #000; max-height: 70vh; }
 }
 
 [hidden] { display: none !important; }
+
+/* option widgets */
+.combo { display: flex; gap: 6px; flex-wrap: wrap; }
+.combo select { flex: 1 1 180px; min-width: 0; }
+.combo input { flex: 1 1 140px; min-width: 0; }
+.rangebox { display: flex; align-items: center; gap: 10px; }
+.rangebox input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); padding: 0; border: none; background: transparent; height: 22px; }
+.rangebox input[type=range].inherited { opacity: .45; }
+.rangebox .rnum { width: 84px; flex: none; }
+.rangebox .rzero { flex: none; }
+
+/* chapter picker */
+.chlist { max-height: 300px; overflow: auto; border: 1px solid var(--line); border-radius: 9px; padding: 4px; }
+.chrow { display: flex !important; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 7px; font-weight: 500 !important; margin: 0 !important; cursor: pointer; }
+.chrow:hover { background: var(--panel2); }
+.chrow.on { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.chrow .chn { width: 34px; text-align: right; color: var(--muted); flex: none; }
+.chrow .chtitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chrow button { padding: 1px 7px; }
+
+/* chapter viewer */
+.viewer { position: fixed; inset: 0; z-index: 60; background: #0b0b0e; display: flex; flex-direction: column; }
+.vbar { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: #15151b; border-bottom: 1px solid #26262e; color: #eee; }
+.vbar .vtitle { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50vw; }
+.vbody { flex: 1; overflow: auto; display: flex; flex-direction: column; align-items: center; }
+.vstrip { width: min(800px, 100%); display: flex; flex-direction: column; }
+.vstrip img { width: 100%; display: block; min-height: 200px; background: #16161b; }
+.vpage { max-height: calc(100vh - 56px); max-width: 100%; object-fit: contain; margin: auto; cursor: pointer; user-select: none; }
+.vbook { width: min(720px, 100%); padding: 24px 18px 80px; color: #e6e6ea; line-height: 1.7; font-size: 17px; }
+.vbook p { margin: 0 0 1em; }
+.vimgs { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+.vimgs img { max-height: 320px; max-width: 100%; border-radius: 6px; }

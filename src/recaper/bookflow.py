@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -405,6 +406,8 @@ class Gallery:
         self.budget = cfg.images.max_generated
         ok, why = imagegen.available(cfg.images.generator)
         self.enabled, self.why = ok, why
+        self._lock = threading.Lock()  # generate() runs in parallel threads
+        self._next = 1 + max((int(it["id"].rsplit("p", 1)[-1]) for it in self.items if it["id"].startswith("gen-p")), default=0)
 
     def _save(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -414,24 +417,28 @@ class Gallery:
         spec = self.cfg.images.generator
         full = f"{self.cfg.images.style}. {prompt}"
         key = imagegen.cache_key(spec, full, refs)
-        if key in self.by_key and (self.work / self.by_key[key]["file"]).exists():
-            return self.by_key[key]["id"]
-        if cached_only:
-            return None
-        if not self.enabled:
-            imagegen.warn_once(f"image generation unavailable: {self.why} - using the nearest real image instead")
-            return None
-        if self.budget <= 0:
-            imagegen.warn_once(f"generated-image budget ({self.cfg.images.max_generated}) used up - reusing real images")
-            return None
-        n = len(self.items) + 1
+        with self._lock:  # reserve a slot: id + budget
+            if key in self.by_key and (self.work / self.by_key[key]["file"]).exists():
+                return self.by_key[key]["id"]
+            if cached_only:
+                return None
+            if not self.enabled:
+                imagegen.warn_once(f"image generation unavailable: {self.why} - using the nearest real image instead")
+                return None
+            if self.budget <= 0:
+                imagegen.warn_once(f"generated-image budget ({self.cfg.images.max_generated}) used up - reusing real images")
+                return None
+            n, self._next = self._next, self._next + 1
+            self.budget -= 1
         rel = Path("panels") / "gen" / f"p{n:04d}.png"
         try:
             imagegen.generate(spec, full, refs, self.work / rel)
         except imagegen.ImageGenError as e:
             msg = str(e).lower()
-            if any(k in msg for k in ("credit", "quota", "billing", "402", "429", "exhausted", "api key", "permission")):
-                self.enabled, self.why = False, f"{spec} unavailable ({str(e)[:160]})"  # stop trying for this run
+            with self._lock:
+                self.budget += 1
+                if any(k in msg for k in ("credit", "quota", "billing", "402", "429", "exhausted", "api key", "permission", "not installed", "sign in")):
+                    self.enabled, self.why = False, f"{spec} unavailable ({str(e)[:160]})"  # stop trying for this run
             imagegen.warn_once(f"image generation failed: {str(e)[:200]}")
             return None
         img = _trim_letterbox(imread(self.work / rel))
@@ -440,10 +447,10 @@ class Gallery:
         rel = rel.with_suffix(".jpg")
         item = {"id": f"gen-p{n:04d}", "chapter": "gen", "file": rel.as_posix(), "w": int(img.shape[1]), "h": int(img.shape[0]),
                 "page": None, "key": key, "prompt": prompt, "refs": [str(r) for r in refs]}  # fmt: skip
-        self.items.append(item)
-        self.by_key[key] = item
-        self.budget -= 1
-        self._save()
+        with self._lock:
+            self.items.append(item)
+            self.by_key[key] = item
+            self._save()
         return item["id"]
 
     def title_card(self, title: str) -> str:
@@ -550,7 +557,7 @@ def fill_pictures(chapters_out: list[dict], all_notes: list[dict], bible: Bible,
             if quota[i] < asked[i]:
                 quota[i] += 1
     stats = {"generated": 0, "reused": 0, "cards": 0}
-    done = 0
+    tasks = []
     for ci, ch in enumerate(chapters_out):
         want = [b for b in ch["beats"] if not b["panels"] and b.get("generate")]
         if not want:
@@ -559,14 +566,20 @@ def fill_pictures(chapters_out: list[dict], all_notes: list[dict], bible: Bible,
         step = len(want) / quota[ci] if quota[ci] else 0
         picks = {int(k * step) for k in range(quota[ci])} if quota[ci] else set()
         for k, b in enumerate(want):
-            done += 1
-            progress.emit("script", None, None, f"pictures {done}/{total_asked}")
-            cached_only = k not in picks
             who = {c.lower() for c in b.get("chars") or []}
             refs = sorted(ref_pool, key=lambda pc: -len(pc[1] & who))[: max(0, cfg.images.refs)]
             looks = "; ".join(f"{c}: {bible.characters[c]['desc']}" for c in b.get("chars") or [] if c in bible.characters)
             prompt = f"Scene: {b['generate']}" + (f" Characters - {looks}" if looks else "")
-            pid = gallery.generate(prompt, [p for p, _ in refs], cached_only=cached_only)
+            tasks.append((b, prompt, [p for p, _ in refs], k not in picks))
+
+    def make(task):
+        b, prompt, refs, cached_only = task
+        return b, gallery.generate(prompt, refs, cached_only=cached_only)
+
+    # image APIs and the Antigravity agent are slow per image (10-70 s) but take parallel requests
+    with ThreadPoolExecutor(max(1, min(4, cfg.jobs))) as pool:
+        for done, (b, pid) in enumerate(pool.map(make, tasks), start=1):
+            progress.emit("script", None, None, f"pictures {done}/{total_asked}")
             if pid:
                 b["panels"] = [pid]
                 stats["generated"] += 1

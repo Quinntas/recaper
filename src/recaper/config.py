@@ -74,9 +74,10 @@ class RenderConfig:
     transition_speed: float = 1.0  # card slide / cross-dissolve speed multiplier (>1 = snappier)
     fill: float = 0.92  # share of the frame panels may occupy
     max_upscale: float = 2.4  # max panel enlargement (higher = bigger but softer low-res art)
+    upscaler: str = "auto"  # auto | off | fast | quality - Real-ESRGAN for panels shown enlarged (GPU)
     bg_blur: float = 6.0  # blurfill / blur background: blur strength
     bg_dim: float = 0.5  # blurfill / blur background: brightness (0-1)
-    chunk_seconds: float = 20.0  # render work-unit length (parallelism / cache granularity)
+    chunk_seconds: float = 40.0  # render work-unit length (parallelism / cache granularity); 40 s measured fastest
 
 
 @dataclass
@@ -88,7 +89,7 @@ class BookConfig:
 
 @dataclass
 class ImagesConfig:
-    generator: str = "none"  # none | gemini[:model] | openai[:model] - fills beats no real image fits
+    generator: str = "none"  # none | gemini[:model] | openai[:model] | antigravity[:model] - fills beats no real image fits
     style: str = "official light-novel illustration style, clean anime line art, soft colours, cinematic composition"
     max_generated: int = 40  # cap per video (cost control); beyond it the nearest real image is reused
     refs: int = 3  # reference images (official art) sent with each generation for style/character consistency
@@ -121,6 +122,9 @@ class Config:
     hook: bool = True  # open with a cold-open hook
     hook_words: int = 110  # hook length target (hard cap +20%)
     outro: str = ""  # optional closing line voiced at the very end (e.g. a call to action)
+    polish: bool = True  # one editing pass per chapter: removes repeated tics, varies openings, checks names
+    episode_minutes: float = 0  # split long recaps into parts of about this length (0 = one video)
+    previously: bool = True  # parts 2+ open with a short 'previously on' recap
     image_sources: str = ""  # comma-separated library projects (e.g. the manga adaptation) whose panels illustrate this one
     panels: PanelsConfig = field(default_factory=PanelsConfig)
     book: BookConfig = field(default_factory=BookConfig)

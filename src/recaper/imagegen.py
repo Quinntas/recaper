@@ -4,6 +4,9 @@ Each request carries reference images taken from the work's official art (cover,
 adaptation panels) so the result matches its style and characters. Providers:
   gemini[:model]   GEMINI_API_KEY / GOOGLE_API_KEY - default model gemini-2.5-flash-image
   openai[:model]   OPENAI_API_KEY - default model gpt-image-1 (images.edit with the references)
+  antigravity[:model]  your Google AI plan through Antigravity, no API key: the agent's generate_image tool.
+                   The tool takes no images, so the model describes the references' style in its prompt
+                   (style matches well, faces less exactly than gemini/openai, which see the references).
 Results are cached by (provider, prompt, references), so re-runs never pay twice.
 """
 
@@ -13,6 +16,7 @@ import base64
 import hashlib
 import io
 import os
+import time
 from pathlib import Path
 
 from PIL import Image
@@ -34,7 +38,15 @@ def available(spec: str) -> tuple[bool, str]:
     if name == "openai":
         ok = bool(os.environ.get("OPENAI_API_KEY"))
         return ok, "" if ok else "set OPENAI_API_KEY to generate images with OpenAI"
-    return False, f"unknown image generator {spec!r} (none | gemini[:model] | openai[:model])"
+    if name == "antigravity":
+        from .llm.antigravity import find_login, find_server
+
+        if not find_server():
+            return False, "Antigravity is not installed (install it in T3 Code)"
+        if not find_login():
+            return False, "sign in to Antigravity in T3 Code"
+        return True, ""
+    return False, f"unknown image generator {spec!r} (none | gemini[:model] | openai[:model] | antigravity[:model])"
 
 
 def _ref_bytes(path: Path, max_edge: int = 1024) -> bytes:
@@ -62,15 +74,35 @@ def generate(spec: str, prompt: str, refs: list[Path], dest: Path) -> Path:
         if refs
         else f"{prompt}\n\nWidescreen 16:9 composition. No text, no speech bubbles, no captions, no watermark."
     )
+    from . import usage
+
+    t0 = time.time()
     try:
-        data = _gemini(model or "gemini-2.5-flash-image", full, refs) if name == "gemini" else _openai(model or "gpt-image-1", full, refs)
-    except ImageGenError:
-        raise
+        if name == "antigravity":
+            data = _antigravity(model or None, full, refs)
+        elif name == "gemini":
+            data = _gemini(model or "gemini-2.5-flash-image", full, refs)
+        else:
+            data = _openai(model or "gpt-image-1", full, refs)
     except Exception as e:  # noqa: BLE001 - surface provider errors uniformly
+        usage.record("image", provider=spec, outcome="failed", refs=len(refs), seconds=round(time.time() - t0, 1), error=str(e)[:200])
+        if isinstance(e, ImageGenError):
+            raise
         raise ImageGenError(f"{name}: {e}") from e
+    usage.record("image", provider=spec, outcome="ok", refs=len(refs), seconds=round(time.time() - t0, 1))
     with Image.open(io.BytesIO(data)) as im:
         im.convert("RGB").save(dest, "PNG")
     return dest
+
+
+def _antigravity(model: str | None, prompt: str, refs: list[Path]) -> bytes:
+    import tempfile
+
+    from .llm.antigravity import generate_image
+
+    with tempfile.TemporaryDirectory(prefix="recaper-img-") as tmp:
+        out = generate_image(prompt, refs, Path(tmp) / "image", model=model)
+        return out.read_bytes()
 
 
 def _gemini(model: str, prompt: str, refs: list[Path]) -> bytes:

@@ -28,7 +28,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-kokoro = ["realtimetts[kokoro]>=0.5", "torch>=2.7"]
+kokoro = ["realtimetts[kokoro]>=0.5", "torch>=2.7", "spandrel>=0.4"]
+upscale = ["torch>=2.7", "spandrel>=0.4"]  # Real-ESRGAN panel upscaling (included in kokoro)
 edge = ["realtimetts[edge]>=0.5"]
 coqui = ["realtimetts[coqui]>=0.5", "torch>=2.7"]
 elevenlabs = ["realtimetts[elevenlabs]>=0.5"]

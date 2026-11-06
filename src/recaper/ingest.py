@@ -54,30 +54,46 @@ def _images_in(folder: Path) -> list[Path]:
     )
 
 
-def discover(input_dir: Path, work_dir: Path) -> list[Chapter]:
-    entries: list[tuple[str, list[Path]]] = []
+@dataclass
+class Entry:
+    """A chapter as found on disk, before any extraction (same order and numbering as discover())."""
+
+    title: str
+    path: Path
+    kind: str  # folder | images | cbz | zip | pdf
+
+
+def list_entries(input_dir: Path) -> list[Entry]:
+    entries: list[Entry] = []
     for child in input_dir.iterdir():
         if child.name.startswith(".") or child.name == WORK_DIR_NAME:
             continue
         if child.is_dir():
-            imgs = _images_in(child)
-            if imgs:
-                entries.append((child.name, imgs))
+            if _images_in(child):
+                entries.append(Entry(child.name, child, "folder"))
             else:  # allow one level deeper (e.g. Volume 1/Chapter 3/)
                 for sub in child.iterdir():
-                    if sub.is_dir() and (sub_imgs := _images_in(sub)):
-                        entries.append((f"{child.name}/{sub.name}", sub_imgs))
-        elif child.suffix.lower() in ARCHIVE_EXTS:
-            entries.append((child.stem, _extract_archive(child, work_dir / "pages" / _slug(child.stem))))
-        elif child.suffix.lower() in PDF_EXTS:
-            entries.append((child.stem, _render_pdf(child, work_dir / "pages" / _slug(child.stem))))
+                    if sub.is_dir() and _images_in(sub):
+                        entries.append(Entry(f"{child.name}/{sub.name}", sub, "folder"))
+        elif child.suffix.lower() in ARCHIVE_EXTS | PDF_EXTS:
+            entries.append(Entry(child.stem, child, child.suffix.lower().lstrip(".")))
+    if not entries and _images_in(input_dir):
+        entries.append(Entry(input_dir.name, input_dir, "images"))
+    entries.sort(key=lambda e: _chapter_sort_key(e.title))
+    return entries
 
-    loose = _images_in(input_dir)
-    if loose and not entries:
-        entries.append((input_dir.name, loose))
 
-    entries.sort(key=lambda e: _chapter_sort_key(e[0]))
-    return [Chapter(i, title, pages) for i, (title, pages) in enumerate(entries) if pages]
+def entry_pages(entry: Entry, work_dir: Path) -> list[Path]:
+    """Page images of one entry (archives / PDFs are extracted once into work_dir/pages/, as for the pipeline)."""
+    if entry.kind in ("folder", "images"):
+        return _images_in(entry.path)
+    dest = work_dir / "pages" / _slug(entry.path.stem)
+    return _extract_archive(entry.path, dest) if entry.kind in ("cbz", "zip") else _render_pdf(entry.path, dest)
+
+
+def discover(input_dir: Path, work_dir: Path) -> list[Chapter]:
+    chapters = [(e.title, entry_pages(e, work_dir)) for e in list_entries(input_dir)]
+    return [Chapter(i, title, pages) for i, (title, pages) in enumerate(chapters) if pages]
 
 
 def _slug(text: str) -> str:

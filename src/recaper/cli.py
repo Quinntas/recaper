@@ -43,6 +43,8 @@ def run(
     until: str = typer.Option("render", help="Stop after stage: panels | read | script | voice | render"),
     force: list[str] = typer.Option([], "--force", "-f", help="Redo a stage (repeatable): panels | read | script | voice | render"),
     preview: bool = typer.Option(False, help="Write panel contact sheets to .recaper/preview/ (check the slicing)"),
+    quick: bool = typer.Option(False, "--quick", help="Quick preview: only the first ~60 s, rendered at 480p (<name>_preview.mp4)"),
+    parts: Optional[float] = typer.Option(None, "--parts", help="Split into parts of about N minutes, each with a 'previously on' intro (0 = one video)"),
 ):
     """Run the pipeline (resumable: finished stages are reused)."""
     from .pipeline import Project
@@ -66,6 +68,7 @@ def run(
         "render.fps": fps,
         "render.encoder": encoder,
         "render.workers": workers,
+        "episode_minutes": parts,
     }
     if resolution:
         w, h = resolution.lower().split("x")
@@ -75,20 +78,25 @@ def run(
 
     cfg = Config.load(folder, overrides)
     project = Project(folder, cfg)
-    if force:
-        project.force(force)
+    from . import usage
 
-    project.stage_panels(preview=preview)
-    if until == "panels":
-        return
-    script = project.stage_script(until_read=(until == "read"))
-    if until in ("read", "script"):
-        return
-    timed, narration, markers = project.stage_voice(script)
-    if until == "voice":
-        console.print(f"narration written to {narration}")
-        return
-    project.stage_render(timed, narration, markers, out)
+    usage.start(project.work, until=until, quick=quick, force=force, reader=cfg.reader, writer=cfg.writer,
+                generator=cfg.images.generator, tts=cfg.tts.engine)  # fmt: skip
+    outputs: list[Path] = []
+    try:
+        if force:
+            project.force(force)
+        project.stage_panels(preview=preview)
+        if until != "panels":
+            script = project.stage_script(until_read=(until == "read"))
+            if until not in ("read", "script") and script:
+                outputs = project.produce(script, out, until=until, quick=quick)
+                if until == "voice":
+                    console.print(f"narration written to {project.work}")
+    except BaseException as e:
+        usage.record("end", status="cancelled" if isinstance(e, KeyboardInterrupt) else "failed", error=str(e)[:500])
+        raise
+    usage.record("end", status="done", outputs=[o.name for o in outputs])
 
 
 @app.command()

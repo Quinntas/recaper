@@ -176,27 +176,42 @@ class Chain:
     def describe(self) -> str:
         return " -> ".join(p.label() for p in self.providers)
 
+    def _record(self, provider: Provider, parts: Sequence[Part], system: str, raw: str, t0: float, outcome: str) -> None:
+        from .. import usage
+
+        images = sum(1 for p in parts if isinstance(p, ImagePart))
+        chars = len(system) + sum(len(p) for p in parts if isinstance(p, str))
+        usage.record("llm", role=self.role, provider=provider.label(), outcome=outcome, images_sent=images,
+                     chars_in=chars, chars_out=len(raw or ""), seconds=round(time.time() - t0, 2))  # fmt: skip
+
     def complete_json(self, system: str, parts: Sequence[Part], retries: int = 3) -> Any:
         last: Exception | None = None
         for idx, provider in enumerate(self.providers):
             if idx in self._dead:
                 continue
             for attempt in range(retries + 1):
+                t0 = time.time()
+                raw = ""
                 try:
                     raw = provider.complete(system, parts)
                     if is_refusal_message(raw):
                         raise RefusalError(re.sub(r"\s+", " ", raw).strip()[:180])
-                    return extract_json(raw)
+                    out = extract_json(raw)
                 except (QuotaError, UnavailableError) as e:
+                    self._record(provider, parts, system, raw, t0, "quota" if isinstance(e, QuotaError) else "unavailable")
                     console.print(f"[yellow]{self.role}: {provider.label()} unavailable ({e}); falling back[/]")
                     self._dead.add(idx)
                     last = e
                     break
                 except RefusalError as e:
+                    self._record(provider, parts, system, raw, t0, "refusal")
                     console.print(f"[yellow]{self.role}: {provider.label()} refused this prompt ({e}); trying fallback[/]")
                     last = e
                     break
                 except Exception as e:  # noqa: BLE001 - any provider failure is retryable
+                    msg = str(e)
+                    self._record(provider, parts, system, raw, t0,
+                                 "quota" if is_quota_message(msg) else "refusal" if is_refusal_message(msg) else "error")  # fmt: skip
                     if is_quota_message(str(e)):  # cap reported through a generic error
                         console.print(f"[yellow]{self.role}: {provider.label()} hit its usage cap ({e}); falling back[/]")
                         self._dead.add(idx)
@@ -211,6 +226,9 @@ class Chain:
                         wait = 5 * 2**attempt  # 5, 10, 20s: rides out rate limits from parallel calls
                         console.print(f"[yellow]{self.role}: {provider.label()} failed ({e}); retry {attempt + 1}/{retries} in {wait}s[/]")
                         time.sleep(wait)
+                else:
+                    self._record(provider, parts, system, raw, t0, "ok")
+                    return out
         if isinstance(last, QuotaError) and len(self._dead) == len(self.providers):
             raise QuotaError(
                 f"every {self.role} provider is out of quota ({last}). Wait for the reset or add a fallback, "

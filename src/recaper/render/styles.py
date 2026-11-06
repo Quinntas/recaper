@@ -168,6 +168,31 @@ class _Base:
             cv2.rectangle(img, (0, 0), (img.shape[1] - 1, img.shape[0] - 1), self.border_color, 2)
         return img
 
+    def card_gpu(self, gpu, canvas, pid: str, base: Rect, rect: Rect, alpha: float, cam: tuple[float, float, float],
+                 scroll: float, border: bool, shadow: float = 0.0) -> None:
+        """draw_card on the GPU canvas (same geometry, shadow and anti-aliased edges)."""
+        bw, bch = int(round(base.w)), int(round(base.content_h))
+        img = self._scaled(pid, bw, bch, border)
+        f = rect.w / max(base.w, 1)
+        s, dx, dy = cam
+        cx, cy = self.W / 2, self.H / 2
+        X = cx + (rect.x - cx) * s + dx
+        Y = cy + (rect.y - cy) * s + dy
+        sc = f * s
+        tex = gpu.tex(img)
+        view_h = int(round(base.h))
+        if bch > view_h + 1:  # scrolling card: crop rows on the device (the texture is uploaded once)
+            off = (bch - view_h) * clamp01(scroll)
+            oi = int(off)
+            tex = tex[:, :, oi : oi + view_h + 1]
+            Y -= (off - oi) * sc
+        shadow *= self.look.shadow
+        if shadow > 0:
+            sprite, pad = self._shadow(tex.shape[3], min(tex.shape[2], view_h))
+            off_x, off_y = self.H * 0.008, self.H * 0.012
+            gpu.shadow(canvas, gpu.tex(sprite), sc, X + (off_x - pad) * sc, Y + (off_y - pad) * sc, shadow * alpha)
+        gpu.blit(canvas, tex, sc, X, Y, alpha)
+
     def draw_card(
         self,
         canvas: np.ndarray,
@@ -320,17 +345,65 @@ class MotionStyle(_Base):
         prv = self.layout(prev.panels) if prev else {}
         cam = camera(shot.emphasis, t, shot.dur, self.look.camera, self.look.hit_effect)
         scroll = ease_in_out_sine(clamp01((t - 0.3) / max(shot.dur - 0.5, 0.5)))
-        slide = self.W * 0.38
         starts, settle = self._entries(cur, prv, shot.dur)
 
         if t >= settle:
             # steady state: one cached composition, camera applied as a single whole-frame warp
+            # (frame_gpu does the same on the GPU)
             frame = warp_frame(self._settled(tuple(shot.panels)), *cam)
             for pid, r in cur.items():
                 if r.content_h > r.h + 1:
                     self.draw_card(frame, pid, r, r, 1.0, cam, scroll, border=self.look.card_border, shadow=0.0)
             return frame
 
+        return self._transition(shot, prev, t, cur, prv, cam, scroll, starts)
+
+    def frame_gpu(self, gpu, shot: Shot, prev: Shot | None, t: float):
+        """Every motion frame on the GPU: settled = warp of the cached layer, transitions = cards composed on device."""
+        cur = self.layout(shot.panels)
+        prv = self.layout(prev.panels) if prev else {}
+        starts, settle = self._entries(cur, prv, shot.dur)
+        cam = camera(shot.emphasis, t, shot.dur, self.look.camera, self.look.hit_effect)
+        scroll = ease_in_out_sine(clamp01((t - 0.3) / max(shot.dur - 0.5, 0.5)))
+        if t < settle:
+            return self._transition_gpu(gpu, shot, prev, t, cur, prv, cam, scroll, starts)
+        frame = gpu.warp(self._settled(tuple(shot.panels)), *cam)
+        for pid, r in cur.items():
+            if r.content_h > r.h + 1:
+                self.card_gpu(gpu, frame, pid, r, r, 1.0, cam, scroll, border=self.look.card_border)
+        return frame
+
+    def _transition_gpu(self, gpu, shot: Shot, prev: Shot | None, t: float, cur: dict, prv: dict, cam, scroll: float, starts: dict):
+        """_transition on the GPU (keep the two in step)."""
+        slide = self.W * 0.38
+        canvas = gpu.tex(self.background(shot.panels)).clone()
+        if self.bg is None and prev is not None and prev.panels[0] != shot.panels[0]:
+            canvas = gpu.blend(canvas, gpu.tex(self.background(prev.panels)), clamp01(t / self.T_OUT))
+        border = self.look.card_border
+        for pid, r in prv.items():
+            if pid in cur:
+                continue
+            p = ease_in_out_cubic(t / self.T_OUT)
+            if p >= 1:
+                continue
+            k = 1 - 0.08 * p
+            moved = Rect(r.x + r.w * (1 - k) / 2 - self.W * 0.03 * p, r.y + r.h * (1 - k) / 2, r.w * k, r.h * k, r.content_h * k)
+            self.card_gpu(gpu, canvas, pid, r, moved, 1 - p, cam, 1.0, border, shadow=0.35 * (1 - p))
+        for pid, r in cur.items():
+            if pid in prv:
+                q = ease_in_out_cubic(t / self.T_MOVE)
+                self.card_gpu(gpu, canvas, pid, r, prv[pid].lerp(r, q), 1.0, cam, scroll, border, shadow=0.35)
+                continue
+            q = (t - starts[pid]) / self.T_IN
+            if q <= 0:
+                continue
+            e = ease_out_back(q)
+            moved = Rect(r.x + slide * (1 - e), r.y, r.w, r.h, r.content_h)
+            self.card_gpu(gpu, canvas, pid, r, moved, clamp01(q * 2.5), cam, scroll, border, shadow=0.35)
+        return canvas
+
+    def _transition(self, shot: Shot, prev: Shot | None, t: float, cur: dict, prv: dict, cam, scroll: float, starts: dict) -> np.ndarray:
+        slide = self.W * 0.38
         canvas = self.background(shot.panels).copy()
         if self.bg is None and prev is not None and prev.panels[0] != shot.panels[0]:
             q = clamp01(t / self.T_OUT)  # blurred backgrounds cross-fade between beats
@@ -398,16 +471,33 @@ class BlurFillStyle(_Base):
         self.draw_card(canvas, pid, r, r, 1.0, (1.0, 0.0, 0.0), 0.0, border=False, shadow=0.55, image=not scrolling)
         return canvas
 
+    def _cam(self, shot: Shot, t: float) -> tuple[float, float, float]:
+        e = ease_in_out_sine(clamp01(t / max(shot.dur, 1e-3)))
+        if shot.emphasis == "hit" and self.look.hit_effect > 0:
+            return camera("hit", t, shot.dur, self.look.camera, self.look.hit_effect)
+        zoom = (0.06 if shot.emphasis == "reveal" else 0.045) * self.look.camera
+        s = 1 + zoom * e if shot.index % 2 == 0 else 1 + zoom * (1 - e)
+        return (s, 0.0, 0.0)
+
+    def _render_gpu(self, gpu, shot: Shot, t: float):
+        pid = shot.panels[0]
+        cam = self._cam(shot, t)
+        frame = gpu.warp(self._layers(pid), *cam)
+        r = self._rect(pid)
+        if r.content_h > r.h + 1:
+            scroll = ease_in_out_sine(clamp01((t - 0.25) / max(shot.dur - 0.4, 0.4)))
+            self.card_gpu(gpu, frame, pid, r, r, 1.0, cam, scroll, border=False)
+        return frame
+
+    def frame_gpu(self, gpu, shot: Shot, prev: Shot | None, t: float):
+        img = self._render_gpu(gpu, shot, t)
+        if prev is not None and t < self.XFADE and prev.panels != shot.panels:
+            img = gpu.blend(img, self._render_gpu(gpu, prev, prev.dur), t / self.XFADE)
+        return img
+
     def _render(self, shot: Shot, t: float) -> np.ndarray:
         pid = shot.panels[0]
-        p = clamp01(t / max(shot.dur, 1e-3))
-        e = ease_in_out_sine(p)
-        if shot.emphasis == "hit" and self.look.hit_effect > 0:
-            cam = camera("hit", t, shot.dur, self.look.camera, self.look.hit_effect)
-        else:
-            zoom = (0.06 if shot.emphasis == "reveal" else 0.045) * self.look.camera
-            s = 1 + zoom * e if shot.index % 2 == 0 else 1 + zoom * (1 - e)
-            cam = (s, 0.0, 0.0)
+        cam = self._cam(shot, t)
         # whole composition moves as one camera: a single warp per frame
         frame = warp_frame(self._layers(pid), *cam)
         r = self._rect(pid)

@@ -37,6 +37,8 @@ class RunBody(BaseModel):
     force: list[str] = []
     preview: bool = False
     output: str | None = None
+    quick: bool = False  # first ~60 s at 480p
+    chapters: str | None = None  # e.g. "1-5,8" (1-based, pipeline order); None = the project's setting
 
 
 class CreateBody(BaseModel):
@@ -438,11 +440,102 @@ def create_app(library: Path) -> FastAPI:
             raise HTTPException(400, "bad stage")
         if body.output and not re.match(r"^[\w .()-]{1,80}\.mp4$", body.output):
             raise HTTPException(400, "output must be a simple .mp4 file name")
+        if body.chapters and not re.match(r"^\s*\d+(\s*-\s*\d*)?(\s*,\s*\d+(\s*-\s*\d*)?)*\s*$", body.chapters):
+            raise HTTPException(400, "chapters must look like 1-5,8")
         try:
-            job = jobs.run_pipeline(name, p, body.until, body.force, body.preview, body.output)
+            job = jobs.run_pipeline(name, p, body.until, body.force, body.preview, body.output, body.quick, body.chapters)
         except RuntimeError as e:
             raise HTTPException(409, str(e)) from e
         return job.view()
+
+    # ---------------------------------------------------------------- chapter index / viewer
+    def chapter_index(p: Path, cfg: Config) -> dict:
+        """Chapters in pipeline order (the numbers --chapters uses), with their processing status."""
+        from ..books import extract, is_book_project
+        from ..ingest import list_entries
+
+        work = p / WORK_DIR_NAME
+        is_book = cfg.source == "book" or (cfg.source == "auto" and is_book_project(p))
+        items: list[dict] = []
+        if is_book:
+            bc = cfg.book
+            for i, c in enumerate(extract(p, work, bc.split_words, bc.min_words, bc.min_illustration)):
+                items.append({"n": i + 1, "title": c.title, "volume": c.volume, "words": c.words, "images": len(c.images)})
+        else:
+            for i, e in enumerate(list_entries(p)):
+                pages = None
+                if e.kind in ("folder", "images"):
+                    pages = sum(1 for f in e.path.iterdir() if f.suffix.lower() in IMAGE_EXTS)
+                items.append({"n": i + 1, "title": e.title, "kind": e.kind, "file": e.path.relative_to(p).as_posix() if e.path != p else "", "pages": pages})
+        script_dir = work / "script"
+        for it in items:
+            cid = f"c{it['n']:04d}"
+            it["cid"] = cid
+            it["read"] = (work / "notes" / f"{cid}.json").exists()
+            it["written"] = script_dir.exists() and any(script_dir.glob(f"{cid}_*.json"))
+        from ..config import parse_chapter_ranges
+
+        try:
+            selected = [i + 1 for i in parse_chapter_ranges(cfg.chapters, len(items))] if items else []
+        except ValueError:
+            selected = [it["n"] for it in items]
+        return {"kind": "book" if is_book else "pages", "chapters": items, "selection": cfg.chapters or "", "selected": selected}
+
+    @app.get("/api/projects/{name}/chapter-index")
+    def get_chapter_index(name: str):
+        p = project_dir(name)
+        return chapter_index(p, Config.load(p, {}))
+
+    @app.get("/api/projects/{name}/chapter-view/{n}")
+    def chapter_view(name: str, n: int):
+        """Pages (manga / manhwa) or text + illustrations (books) of chapter n, for the in-browser viewer."""
+        from ..books import extract, is_book_project
+        from ..ingest import entry_pages, list_entries
+
+        p = project_dir(name)
+        cfg = Config.load(p, {})
+        work = p / WORK_DIR_NAME
+        base = f"/api/projects/{name}/file/"
+
+        def url(f: Path) -> str:
+            from urllib.parse import quote
+
+            return base + quote(f.relative_to(p).as_posix())
+
+        if cfg.source == "book" or (cfg.source == "auto" and is_book_project(p)):
+            bc = cfg.book
+            chs = extract(p, work, bc.split_words, bc.min_words, bc.min_illustration)
+            if not 1 <= n <= len(chs):
+                raise HTTPException(404, "chapter not found")
+            c = chs[n - 1]
+            paras = [x.strip() for x in re.split(r"\n\s*\n|\n", c.text) if x.strip()]
+            return {"kind": "book", "n": n, "count": len(chs), "title": c.title, "volume": c.volume, "paragraphs": paras,
+                    "images": [url(work / rel) for rel in c.images if (work / rel).exists()]}  # fmt: skip
+        entries = list_entries(p)
+        if not 1 <= n <= len(entries):
+            raise HTTPException(404, "chapter not found")
+        e = entries[n - 1]
+        try:
+            pages = entry_pages(e, work)
+        except Exception as ex:  # noqa: BLE001 - broken archive / PDF
+            raise HTTPException(422, f"could not open {e.path.name}: {ex}") from ex
+        return {"kind": "pages", "n": n, "count": len(entries), "title": e.title, "pages": [url(f) for f in pages]}
+
+    @app.get("/api/projects/{name}/usage-log")
+    def usage_log(name: str):
+        """Past runs (model calls, quota hits, images, voice, renders) and an estimate of the next full run."""
+        from .. import usage
+        from ..books import is_book_project
+
+        p = project_dir(name)
+        cfg = Config.load(p, {})
+        runs = usage.summarize(usage.read(p / WORK_DIR_NAME))[:30]
+        is_book = cfg.source == "book" or (cfg.source == "auto" and is_book_project(p))
+        try:
+            est = usage.estimate(p, cfg, scan_chapters(p), is_book)
+        except Exception as e:  # noqa: BLE001 - an estimate must never break the page
+            est = {"error": str(e)[:200]}
+        return {"runs": runs, "estimate": est, "is_book": is_book}
 
     @app.get("/api/projects/{name}/script")
     def get_script(name: str):
@@ -536,7 +629,7 @@ def create_app(library: Path) -> FastAPI:
 
     @app.get("/api/sources/{sid}/search")
     def search(sid: str, q: str = "", lang: str | None = None, offset: int = 0, limit: int = 24,
-               sort: str = "relevance", availability: str = "any", nsfw: bool = False):  # fmt: skip
+               sort: str = "relevance", availability: str = "any", nsfw: bool = True):  # fmt: skip
         from dataclasses import asdict
 
         try:
@@ -617,7 +710,7 @@ def create_app(library: Path) -> FastAPI:
                 if link_target:
                     link_image_source(link_target, name)
                 if body.run_after:
-                    jobs.run_pipeline(name, p, body.run.until, body.run.force, body.run.preview, body.run.output)
+                    jobs.run_pipeline(name, p, body.run.until, body.run.force, body.run.preview, body.run.output, body.run.quick)
 
         job = jobs.run_download(name, f"Download {len(picked)} ch. of {manga.title}", work, then)
         return job.view()
@@ -681,7 +774,8 @@ def create_app(library: Path) -> FastAPI:
                 con = get_connector(sid)
                 langs = [c for c, _ in con.languages]
                 items = con.search(query, lang if lang in langs else (langs[0] if langs else None), limit=12,
-                                   sort="relevance", availability="downloadable" if "downloadable" in con.availability else "any")  # fmt: skip
+                                   sort="relevance", availability="downloadable" if "downloadable" in con.availability else "any",
+                                   nsfw=con.supports_nsfw)  # fmt: skip
                 results[sid] = [asdict(m) | {"nsfw": m.nsfw} for m in items]
             except Exception as e:  # noqa: BLE001
                 results[sid] = {"error": str(e)[:200]}

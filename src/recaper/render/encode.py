@@ -31,7 +31,7 @@ def video_codec_args(encoder: str, quality: int, fps: int) -> list[str]:
     gop = ["-g", str(fps * 2)]
     if use_nvenc:
         # p3: ~2.4x the throughput of p5/hq on one NVENC engine; no visible difference on flat comic art.
-        return ["-c:v", "h264_nvenc", "-preset", "p3", "-rc", "vbr", "-cq", str(quality), "-b:v", "0", *gop]
+        return ["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "vbr", "-cq", str(quality), "-b:v", "0", *gop]  # p1: same quality as p3 at CQ 21 (PSNR 53 dB, SSIM .997), ~9% bigger, 1150 vs 870 fps
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(quality), *gop]
 
 
@@ -45,20 +45,11 @@ def open_raw_writer(out: Path, width: int, height: int, fps: int, codec_args: li
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
-def mux_final(
-    chunks: list[Path],
-    narration: Path,
-    out: Path,
-    loudness: float,
-    chapters_meta: Path | None,
-    work_dir: Path,
-) -> None:
-    listing = work_dir / "render" / "concat.txt"
-    listing.write_text("".join(f"file '{c.resolve().as_posix()}'\n" for c in chunks), "utf-8")
-
-    # Pass 1: master the narration (filters + AAC). Kept separate from the mux because recent
-    # ffmpeg builds deadlock when a filtergraph and a stream-less ffmetadata input share a command.
-    master = work_dir / "render" / "narration_master.m4a"
+def master_audio(narration: Path, loudness: float, render_dir: Path) -> Path:
+    """Pass 1: master the narration (filters + AAC). Independent of the video, so it runs while chunks render.
+    Kept separate from the mux because recent ffmpeg builds deadlock when a filtergraph and a stream-less
+    ffmetadata input share a command."""
+    master = render_dir / "narration_master.m4a"
     afilter = (
         "highpass=f=70,"
         "acompressor=threshold=-20dB:ratio=3:attack=5:release=90:makeup=2,"
@@ -70,6 +61,21 @@ def mux_final(
         "audio master",
         timeout=900,
     )
+    return master
+
+
+def mux_final(
+    chunks: list[Path],
+    narration: Path,
+    out: Path,
+    loudness: float,
+    chapters_meta: Path | None,
+    render_dir: Path,
+    master: Path | None = None,
+) -> None:
+    listing = render_dir / "concat.txt"
+    listing.write_text("".join(f"file '{c.resolve().as_posix()}'\n" for c in chunks), "utf-8")
+    master = master or master_audio(narration, loudness, render_dir)
 
     # Pass 2: stream-copy everything together (+ chapters).
     cmd = ["-f", "concat", "-safe", "0", "-i", str(listing), "-i", str(master)]

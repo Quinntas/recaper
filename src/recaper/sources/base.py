@@ -117,7 +117,7 @@ class Connector(ABC):
         offset: int = 0,
         sort: str = "relevance",
         availability: str = "any",
-        nsfw: bool = False,
+        nsfw: bool = True,
     ) -> list[MangaInfo]: ...
 
     @abstractmethod

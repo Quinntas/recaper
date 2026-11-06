@@ -247,3 +247,45 @@ Proven patterns: a relatable statement twisted for the protagonist; in-media-res
 or the premise sold in two sentences plus the question it raises. Do not spoil the ending.
 For pictures pick 1-2 image ids per beat from the USED IMAGES list (they come from the script).
 Reply with ONLY a JSON object: {"beats": [{"text": "...", "panels": ["id"], "emphasis": "hit"}]}"""
+
+
+POLISH_SYSTEM = """You are the line editor of a recap video's narration. You get one chapter of the script as
+numbered beats, the story bible and a list of problems an automatic check found. Rewrite the text of the beats
+so the narration reads like a top recap channel - same story, same facts, same order, same beat count.
+
+""" + STYLE_GUIDE + """
+
+What to fix (only where needed - leave good beats untouched):
+- the problems listed under CHECKS;
+- speech and thoughts reported in the present ("he tells her", "she asks") -> past ("he told her", "she asked");
+- the same word or phrase opening several sentences, repeated pet phrases and tics across beats;
+- too few turns: make roughly every third sentence turn the story ("But", "However", a reveal, a complication);
+- names that differ from the bible (use the bible's exact spelling);
+- clunky, choppy or over-long sentences.
+
+TENSE - the most common mistake, get it exactly right: actions stay in the PRESENT tense ("Jin-woo bursts out
+laughing", "she scolds him"); ONLY the verb that reports speech or a thought goes to the past, together with
+what was said ("he laughed it off" is WRONG -> "he laughs it off and told her that he hunted purely for fun").
+Never turn a whole beat into past-tense storytelling.
+
+Hard rules: keep every beat (same count, same order); keep every action, detail and character moment of the
+original beat (rephrase, never drop); each beat keeps describing what its own pictures show, so never move
+events between beats; keep each beat's length within about 15% of the original; no new facts.
+Reply with ONLY a JSON object: {"texts": ["beat 1 text", "beat 2 text", ...]}"""
+
+
+def polish_user(language: str, bible_text: str, title: str, numbered: str, checks: str, extra: str) -> str:
+    return (
+        f"LANGUAGE: {language}\n\nSTORY BIBLE:\n{bible_text or '(none)'}\n\nCHAPTER: {title}\n\n"
+        f"CHECKS:\n{checks or '(none found - just tighten the prose)'}\n\n"
+        + (f"EXTRA DIRECTIONS:\n{extra}\n\n" if extra.strip() else "")
+        + f"BEATS:\n{numbered}"
+    )
+
+
+PREVIOUSLY_SYSTEM = """You write the "previously on" opening of part {PART} of a multi-part recap video series.
+In about {WORDS} words across 2-4 beats, remind viewers of the story so far: the protagonist, the key turns and
+where things stood at the end of the last part - so the new part makes sense on its own. Start with a short
+line like "Previously," then storytell in the same style as the rest of the series (third person, flowing
+sentences, no questions). For pictures pick 1-2 ids per beat from the IMAGES list.
+Reply with ONLY a JSON object: {"beats": [{"text": "...", "panels": ["id"], "emphasis": "normal"}]}"""

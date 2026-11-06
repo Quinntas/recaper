@@ -180,7 +180,7 @@ async function viewDiscover(q) {
   const sort = sorts.includes(q.get('sort')) ? q.get('sort') : (query ? sorts[0] : (sorts.includes('popular') ? 'popular' : sorts[0]));
   const avails = source.availability.map(([v]) => v);
   const avail = avails.includes(q.get('avail')) ? q.get('avail') : 'any';
-  const nsfw = source.supports_nsfw && (q.has('nsfw') ? q.get('nsfw') === '1' : lsGet('rc.nsfw', '0') === '1');
+  const nsfw = source.supports_nsfw && (q.has('nsfw') ? q.get('nsfw') === '1' : lsGet('rc.nsfw18', '1') === '1');
   lsSet('rc.src', source.id); lsSet('rc.lang', lang);
 
   const srcSel = h('select', { value: source.id, onchange: () => go(`#/discover?src=${enc(srcSel.value)}`) }, srcs.map((s) => h('option', { value: s.id }, s.name)));
@@ -190,7 +190,7 @@ async function viewDiscover(q) {
   const nsfwBox = h('input', { type: 'checkbox', checked: nsfw, disabled: !source.supports_nsfw });
   const input = h('input', { value: query, placeholder: 'Search a title (or leave empty to browse), or paste a link', style: { flex: 1, minWidth: '260px' } });
   const submit = () => {
-    lsSet('rc.nsfw', nsfwBox.checked ? '1' : '0');
+    lsSet('rc.nsfw18', nsfwBox.checked ? '1' : '0');
     go(`#/discover?src=${enc(srcSel.value)}&lang=${enc(langSel.value)}&q=${enc(input.value.trim())}&sort=${enc(sortSel.value)}&avail=${enc(availSel.value)}&nsfw=${nsfwBox.checked ? 1 : 0}`);
   };
   input.addEventListener('keydown', (e) => e.key === 'Enter' && submit());
@@ -486,7 +486,7 @@ setInterval(refreshBadge, 3000);
 async function viewProject(name, tab) {
   const page = STATE.page;
   const p = await api(`/api/projects/${enc(name)}`);
-  const tabs = [['make', 'Make video'], ['options', 'Options'], ['script', 'Script'], ['videos', `Videos${p.videos.length ? ` (${p.videos.length})` : ''}`], ['chapters', `Chapters (${p.chapters})`], ['images', 'Images'], ['panels', 'Panels']];
+  const tabs = [['make', 'Make video'], ['options', 'Options'], ['script', 'Script'], ['videos', `Videos${p.videos.length ? ` (${p.videos.length})` : ''}`], ['chapters', `Chapters (${p.chapters})`], ['images', 'Images'], ['panels', 'Panels'], ['usage', 'Usage']];
   const tabLabel = { make: 'Make video', options: 'Options', script: 'Script', videos: 'Videos', chapters: 'Chapters', images: 'Images', panels: 'Panels' }[tab] || 'Make video';
   page.title = `${p.name} · ${tabLabel}`;
   const body = h('div', {});
@@ -508,9 +508,164 @@ async function viewProject(name, tab) {
         h('button', { class: 'danger', onclick: () => deleteProjectModal(name) }, '🗑 Delete…'))),
     h('div', { class: 'tabs' }, tabs.map(([id, label]) => h('a', { href: `#/p/${enc(name)}?tab=${id}`, class: tab === id ? 'active' : '' }, label))),
     body);
-  const renderers = { make: tabMake, options: tabOptions, script: tabScript, videos: tabVideos, chapters: tabChapters, images: tabImages, panels: tabPanels };
+  const renderers = { make: tabMake, options: tabOptions, script: tabScript, videos: tabVideos, chapters: tabChapters, images: tabImages, panels: tabPanels, usage: tabUsage };
   body.append(await (renderers[tab] || tabMake)(p));
   return view;
+}
+
+// ------------------------------------------------------------------ chapter selection + viewer
+function rangeSpec(nums, total) {
+  const s = [...new Set(nums)].sort((a, b) => a - b);
+  if (!s.length || s.length === total) return '';
+  const out = [];
+  for (let i = 0; i < s.length; i++) {
+    let j = i;
+    while (j + 1 < s.length && s[j + 1] === s[j] + 1) j++;
+    out.push(j > i ? `${s[i]}-${s[j]}` : `${s[i]}`);
+    i = j;
+  }
+  return out.join(',');
+}
+function parseSpec(spec, total) {
+  const out = new Set();
+  for (const part of String(spec || '').split(',').map((x) => x.trim()).filter(Boolean)) {
+    const m = part.match(/^(\d*)\s*-\s*(\d*)$/);
+    if (m) {
+      const a = m[1] ? +m[1] : 1; const b = m[2] ? +m[2] : total;
+      for (let k = Math.max(1, a); k <= Math.min(total, b); k++) out.add(k);
+    } else if (/^\d+$/.test(part) && +part >= 1 && +part <= total) out.add(+part);
+  }
+  return out;
+}
+
+// Chapter picker for the Make tab: returns { el, spec() } - spec '' = all chapters.
+function chapterPicker(p, index) {
+  const total = index.chapters.length;
+  let sel = new Set(index.selected.length ? index.selected : index.chapters.map((c) => c.n));
+  let last = null;
+  const summary = h('span', { class: 'muted small' });
+  const specInput = h('input', { placeholder: 'all chapters, or e.g. 1-5,8', style: { width: '180px' } });
+  const list = h('div', { class: 'chlist' });
+  const boxes = new Map();
+  const sync = (fromInput = false) => {
+    for (const [n, cb] of boxes) { cb.checked = sel.has(n); cb.closest('.chrow').classList.toggle('on', sel.has(n)); }
+    if (!fromInput) specInput.value = rangeSpec([...sel], total);
+    const words = index.kind === 'book' ? index.chapters.filter((c) => sel.has(c.n)).reduce((a, c) => a + (c.words || 0), 0) : 0;
+    summary.textContent = `${sel.size} of ${total} chapter(s)${words ? ` · ${(words / 1000).toFixed(0)}k words` : ''}`
+      + (sel.size && sel.size < total ? ' · saved as a separate video' : '');
+  };
+  specInput.addEventListener('input', () => { sel = parseSpec(specInput.value, total); if (!specInput.value.trim()) sel = new Set(index.chapters.map((c) => c.n)); sync(true); });
+  for (const c of index.chapters) {
+    const cb = h('input', { type: 'checkbox' });
+    cb.addEventListener('click', (e) => {
+      if (e.shiftKey && last !== null) {  // shift-click selects a range
+        const [a, b] = [Math.min(last, c.n), Math.max(last, c.n)];
+        for (let k = a; k <= b; k++) { if (cb.checked) sel.add(k); else sel.delete(k); }
+      } else if (cb.checked) sel.add(c.n); else sel.delete(c.n);
+      last = c.n;
+      sync();
+    });
+    boxes.set(c.n, cb);
+    const meta = index.kind === 'book' ? `${c.words.toLocaleString()} words${c.images ? ` · ${c.images} img` : ''}` : (c.pages ? `${c.pages} pages` : c.kind);
+    list.append(h('label', { class: 'chrow' }, cb,
+      h('span', { class: 'chn mono' }, c.n),
+      h('span', { class: 'chtitle', title: c.title }, c.title),
+      h('span', { class: 'faint small' }, meta),
+      c.read ? h('span', { class: 'chip tiny ok', title: 'Panels already read (cached)' }, 'read') : null,
+      c.written ? h('span', { class: 'chip tiny ok', title: 'Script already written (cached)' }, 'script') : null,
+      h('button', { type: 'button', class: 'small ghost', title: 'Open this chapter', onclick: (e) => { e.preventDefault(); openViewer(p.name, c.n, total); } }, '👁')));
+  }
+  sync();
+  const btn = (label, fn) => h('button', { type: 'button', class: 'small', onclick: () => { fn(); sync(); } }, label);
+  const unread = index.chapters.filter((c) => !c.written).map((c) => c.n);
+  const el = h('div', { class: 'opt wide' },
+    h('label', {}, 'Chapters'),
+    h('div', { class: 'row', style: { marginBottom: '6px' } }, specInput,
+      btn('All', () => { sel = new Set(index.chapters.map((c) => c.n)); }),
+      btn('None', () => { sel = new Set(); }),
+      unread.length && unread.length < total ? btn(`Not written yet (${unread.length})`, () => { sel = new Set(unread); }) : null,
+      h('div', { class: 'spacer' }), summary),
+    total ? list : h('div', { class: 'muted small' }, 'No chapters yet.'),
+    h('div', { class: 'help' }, 'Tick chapters (shift-click selects a range) or type a range. A subset is saved as <title>_ch1-5_recap.mp4, so it never overwrites the full video. Cached chapters cost nothing to reuse.'));
+  return { el, spec: () => rangeSpec([...sel], total), count: () => sel.size };
+}
+
+// Full-screen chapter viewer: strip (webtoon) or page-by-page; books show text + illustrations.
+async function openViewer(project, n, total) {
+  const root = document.getElementById('modal-root');
+  let mode = lsGet('rc.viewer', 'strip');
+  let data = null;
+  let page = 0;
+  const body = h('div', { class: 'vbody' });
+  const title = h('div', { class: 'vtitle' });
+  const pageInfo = h('span', { class: 'muted small' });
+  const close = () => { root.innerHTML = ''; document.removeEventListener('keydown', onKey); };
+  const go = (k) => { if (k >= 1 && k <= total) load(k); };
+  const modeBtn = h('button', { class: 'small', onclick: () => { mode = mode === 'strip' ? 'pages' : 'strip'; lsSet('rc.viewer', mode); draw(); } });
+  const draw = () => {
+    body.innerHTML = '';
+    if (!data) return;
+    modeBtn.hidden = data.kind !== 'pages';
+    modeBtn.textContent = mode === 'strip' ? '▤ Pages' : '▥ Strip';
+    if (data.kind === 'book') {
+      pageInfo.textContent = `${data.paragraphs.length} paragraphs${data.images.length ? ` · ${data.images.length} illustration(s)` : ''}`;
+      body.append(h('div', { class: 'vbook' },
+        data.images.length ? h('div', { class: 'vimgs' }, data.images.map((u) => h('img', { src: u, loading: 'lazy' }))) : null,
+        data.volume ? h('div', { class: 'faint small' }, data.volume) : null,
+        h('h2', {}, data.title), data.paragraphs.map((t) => h('p', {}, t))));
+      body.scrollTop = 0;
+      return;
+    }
+    if (!data.pages.length) { body.append(h('div', { class: 'empty' }, 'No pages.')); return; }
+    if (mode === 'strip') {
+      pageInfo.textContent = `${data.pages.length} pages`;
+      body.append(h('div', { class: 'vstrip' }, data.pages.map((u) => h('img', { src: u, loading: 'lazy' }))));
+      body.scrollTop = 0;
+    } else {
+      page = Math.min(page, data.pages.length - 1);
+      pageInfo.textContent = `page ${page + 1} / ${data.pages.length}`;
+      const img = h('img', { src: data.pages[page], class: 'vpage', onclick: (e) => {
+        const left = e.offsetX < e.target.clientWidth / 2;
+        step(left ? -1 : 1);
+      } });
+      body.append(img);
+      if (data.pages[page + 1]) { const pre = new Image(); pre.src = data.pages[page + 1]; }
+    }
+  };
+  const step = (d) => {
+    if (!data || data.kind !== 'pages' || mode !== 'pages') return;
+    const k = page + d;
+    if (k < 0) { if (n > 1) load(n - 1, true); return; }
+    if (k >= data.pages.length) { go(n + 1); return; }
+    page = k; draw();
+  };
+  const load = async (k, atEnd = false) => {
+    n = k;
+    title.textContent = `Chapter ${k} / ${total}`;
+    body.innerHTML = '';
+    body.append(h('div', { class: 'loading' }, 'Opening chapter…'));
+    try {
+      data = await api(`/api/projects/${enc(project)}/chapter-view/${k}`);
+      title.textContent = `${k}. ${data.title}`;
+      page = atEnd && data.kind === 'pages' ? data.pages.length - 1 : 0;
+      prevBtn.disabled = k <= 1; nextBtn.disabled = k >= total;
+      draw();
+    } catch (e) { body.innerHTML = ''; body.append(h('div', { class: 'empty' }, e.message)); }
+  };
+  const onKey = (e) => {
+    if (e.key === 'Escape') close();
+    else if (e.key === 'ArrowRight') { if (mode === 'pages' && data?.kind === 'pages') step(1); else go(n + 1); }
+    else if (e.key === 'ArrowLeft') { if (mode === 'pages' && data?.kind === 'pages') step(-1); else go(n - 1); }
+  };
+  const prevBtn = h('button', { class: 'small', onclick: () => go(n - 1) }, '‹ Prev chapter');
+  const nextBtn = h('button', { class: 'small', onclick: () => go(n + 1) }, 'Next chapter ›');
+  root.innerHTML = '';
+  root.append(h('div', { class: 'viewer' },
+    h('div', { class: 'vbar' }, title, pageInfo, h('div', { class: 'spacer' }), modeBtn, prevBtn, nextBtn,
+      h('button', { class: 'small ghost', title: 'Close (Esc)', onclick: close }, '✕')),
+    body));
+  document.addEventListener('keydown', onKey);
+  load(n);
 }
 
 async function tabMake(p) {
@@ -520,6 +675,18 @@ async function tabMake(p) {
   const preview = h('input', { type: 'checkbox' });
   const output = h('input', { placeholder: 'default: <title>_recap.mp4' });
   const jobBox = h('div', {});
+  const estimateBox = h('div', {});
+  let index = { kind: 'pages', chapters: [], selected: [], selection: '' };
+  try { index = await api(`/api/projects/${enc(p.name)}/chapter-index`); } catch (e) { toast(e.message, 'bad'); }
+  const picker = chapterPicker(p, index);
+  api(`/api/projects/${enc(p.name)}/usage-log`).then((d) => {
+    const e = d.estimate;
+    if (!e || e.error) return;
+    const bits = [`~${e.reader.calls} reader call(s) (${e.reader.images} panel images)`, `~${e.writer.calls} writer call(s)`];
+    if (e.images.max) bits.push(`up to ${e.images.max} generated images${e.images.usd ? ` (≈ $${e.images.usd.toFixed(2)})` : ''}`);
+    estimateBox.append(h('div', { class: 'card tight row small' }, h('b', {}, 'Next run:'), h('span', { class: 'muted' }, bits.join(' · ')),
+      h('div', { class: 'spacer' }), h('a', { href: `#/p/${enc(p.name)}?tab=usage` }, 'Usage & history →')));
+  }).catch(() => {});
   const doctor = await getDoctor();
   const warn = [];
   const eff = p.effective;
@@ -534,11 +701,14 @@ async function tabMake(p) {
     if (!ok) warn.push(`${role} (${spec}) looks unavailable on this machine - check System check.`);
   }
   if (!p.chapters) warn.push('No chapters yet - add some in the Chapters tab or download them.');
-  const start = async () => {
+  const start = async (quick = false) => {
+    if (index.chapters.length && !picker.count()) { toast('Pick at least one chapter', 'bad'); return; }
+    // '' = all: send an explicit full range when the project's saved options narrow the selection
+    const chapters = picker.spec() || (index.selection ? `1-${index.chapters.length}` : null);
     try {
       const job = await api(`/api/projects/${enc(p.name)}/run`, { json: {
-        until: untilSel.value, force: Object.entries(force).filter(([, el]) => el.checked).map(([k]) => k),
-        preview: preview.checked, output: output.value.trim() || null,
+        until: quick ? 'render' : untilSel.value, force: Object.entries(force).filter(([, el]) => el.checked).map(([k]) => k),
+        preview: preview.checked, output: output.value.trim() || null, quick, chapters,
       } });
       watchJob(job.id, jobBox, { project: p.name });
     } catch (e) { toast(e.message, 'bad'); }
@@ -552,17 +722,76 @@ async function tabMake(p) {
         `reader ${eff.reader} · writer ${eff.writer} · style ${eff.style}`), h('div', { class: 'spacer' }),
         h('a', { class: 'small', href: `#/p/${enc(p.name)}?tab=options` }, 'Change options →')),
       h('div', { class: 'optgrid' },
+        picker.el,
         h('div', { class: 'opt' }, h('label', {}, 'Stop after'), untilSel, h('div', { class: 'help' }, 'Stop after the script to review/edit it before voicing.')),
         h('div', { class: 'opt' }, h('label', {}, 'Output file'), output),
         h('div', { class: 'opt' }, h('label', {}, 'Redo stages (ignore cache)'),
           h('div', { class: 'row' }, STAGES.map(([id, name]) => h('label', { class: 'check' }, force[id], name))),
           h('div', { class: 'help' }, 'Everything is cached; finished stages are skipped unless ticked here.')),
         h('div', { class: 'opt' }, h('label', {}, 'Extras'), h('label', { class: 'check' }, preview, 'Write panel contact sheets (Panels tab)'))),
-      h('div', { class: 'row end', style: { marginTop: '14px' } }, h('button', { class: 'primary', onclick: start, disabled: !!p.active_job }, '▶ Start'))),
+      h('div', { class: 'row end', style: { marginTop: '14px' } },
+        h('span', { class: 'muted small' }, 'Quick preview: the first ~60 s at 480p, to check look, voice and pacing. Its audio is reused by the full run.'),
+        h('button', { onclick: () => start(true), disabled: !!p.active_job, title: 'Writes <title>_recap_preview.mp4' }, '⚡ Quick preview'),
+        h('button', { class: 'primary', onclick: () => start(false), disabled: !!p.active_job }, '▶ Start'))),
+    estimateBox,
     jobBox,
     recent.length ? h('div', { class: 'card' }, h('h3', {}, 'Recent runs'), recent.map((j) => h('div', { class: 'row', style: { padding: '6px 0' } },
       statusChip(j.status), h('span', {}, j.title), h('span', { class: 'muted small' }, fmtDate(j.created)),
       j.error ? h('span', { class: 'faint small' }, j.error.slice(0, 120)) : null))) : null);
+}
+
+// ------------------------------------------------------------------ usage
+function billChip(list) {
+  if (!list || !list.length) return null;
+  return list.includes('api') ? h('span', { class: 'chip warn tiny', title: 'Billed per token by an API key' }, 'API-billed')
+    : h('span', { class: 'chip ok tiny', title: 'Subscription plan, local or free tier: counts against the plan\'s limits, no bill' }, 'plan / free');
+}
+function estimateCard(e, p) {
+  if (!e || e.error) return h('div', { class: 'card tight muted small' }, `No estimate: ${e ? e.error : 'unknown'}`);
+  const row = (label, value, extra = null) => h('tr', {}, h('td', { class: 'muted' }, label), h('td', {}, value, extra ? ' ' : null, extra));
+  const gen = e.images.max ? `up to ${e.images.max} images (${e.images.spec})` : (e.images.spec === 'none' ? 'off' : 'none needed (script exists)');
+  return h('div', { class: 'card stack' },
+    h('div', { class: 'section-title' }, h('h2', {}, 'Next full run (estimate)'), h('span', { class: 'muted small' },
+      `${e.chapters} chapter(s) selected · ${e.unread} to read · ${e.unwritten} to write`)),
+    h('div', { class: 'tablewrap' }, h('table', {}, h('tbody', {},
+      row('Reader (vision)', `~${e.reader.calls} call(s) · ~${e.reader.images} panel images sent`, billChip(e.reader.billing)),
+      row('Writer', `~${e.writer.calls} call(s)`, billChip(e.writer.billing)),
+      row('Image generation', gen, e.images.usd ? h('span', { class: 'chip warn tiny' }, `≈ $${e.images.usd.toFixed(2)} max`) : null),
+      row('Voice', `~${e.voice.words.toLocaleString()} words with ${e.voice.engine} (only changed lines are re-voiced)`),
+      row('Video', `~${e.video.minutes} min${e.video.parts > 1 ? ` in ${e.video.parts} parts` : ''}`),
+      row('Upscaler', `${e.upscaler.mode} · ${e.upscaler.cached} panel(s) already upscaled`)))),
+    h('div', { class: 'muted small' }, 'Finished work is cached, so these counts only cover what is missing. Reading every panel is what uses most of a Claude / Antigravity plan window.'));
+}
+async function tabUsage(p) {
+  const data = await api(`/api/projects/${enc(p.name)}/usage-log`);
+  const runs = data.runs;
+  const runCard = (r) => {
+    const llm = Object.entries(r.llm);
+    const calls = llm.reduce((a, [, v]) => a + v.calls, 0);
+    const quota = llm.reduce((a, [, v]) => a + v.quota, 0);
+    return h('div', { class: 'card stack' },
+      h('div', { class: 'row' }, statusChip(r.status === 'unfinished' ? 'running' : r.status), h('b', {}, fmtDate(r.started)),
+        h('span', { class: 'muted small' }, `${fmtDur(r.seconds)} · ${r.meta.quick ? 'quick preview' : `until ${r.meta.until || 'render'}`}`),
+        quota ? h('span', { class: 'chip bad tiny' }, `${quota} quota hit(s)`) : null,
+        h('div', { class: 'spacer' }), r.outputs.length ? h('span', { class: 'muted small' }, r.outputs.join(', ')) : null),
+      r.error ? h('div', { class: 'chip bad' }, r.error.slice(0, 300)) : null,
+      llm.length ? h('div', { class: 'tablewrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, ['Model', 'Role', 'Calls', 'OK', 'Quota', 'Refused', 'Errors', 'Images sent', 'Text in / out', 'Time'].map((x) => h('th', {}, x)))),
+        h('tbody', {}, llm.map(([prov, v]) => h('tr', {},
+          h('td', {}, h('span', { class: 'mono small' }, prov), ' ', billChip([v.billing])), h('td', {}, v.role), h('td', {}, v.calls), h('td', {}, v.ok),
+          h('td', {}, v.quota || ''), h('td', {}, v.refused || ''), h('td', {}, v.errors || ''), h('td', {}, v.images_sent || ''),
+          h('td', { class: 'small' }, `${(v.chars_in / 1000).toFixed(0)}k / ${(v.chars_out / 1000).toFixed(0)}k chars`), h('td', {}, fmtDur(v.seconds))))))) : null,
+      h('div', { class: 'row small muted' },
+        calls ? null : h('span', {}, 'No model calls (everything cached).'),
+        r.images.ok || r.images.failed ? h('span', {}, `Images: ${r.images.ok} generated${r.images.failed ? `, ${r.images.failed} failed` : ''} (${r.images.provider})`) : null,
+        r.voice.lines ? h('span', {}, `Voice: ${r.voice.lines} new line(s) with ${r.voice.engine}`) : null,
+        r.upscaled ? h('span', {}, `Upscaled ${r.upscaled} panel(s)`) : null,
+        r.renders.map((x) => h('span', {}, `Rendered ${x.output}: ${x.video_minutes} min in ${fmtDur(x.seconds)} (${x.rendered}/${x.chunks} chunks new)`))));
+  };
+  return h('div', { class: 'stack' },
+    estimateCard(data.estimate, p),
+    h('h2', { style: { margin: '6px 0 0' } }, 'Past runs'),
+    runs.length ? runs.map(runCard) : h('div', { class: 'card empty' }, 'No runs logged yet. Every run from now on records its model calls, quota hits, images, voice and render time here.'));
 }
 
 async function getSchema() { return STATE.schema || (STATE.schema = await api('/api/options')); }
@@ -707,6 +936,100 @@ document.addEventListener('click', () => {
   document.querySelectorAll('.msel-menu').forEach((m) => { m.hidden = true; });
 });
 
+// ------------------------------------------------------------------ option widgets
+// Dropdown with labelled (optionally grouped) choices, an "inherited" empty entry and an optional "Custom…" text box.
+function comboSelect({ choices = [], labels = {}, groups = null, custom = false, emptyLabel, value, onchange }) {
+  const flat = groups ? groups.flatMap((g) => g.options.map((o) => String(o[0]))) : choices.map(String);
+  const v = value === '' || value == null ? '' : String(value);
+  const isCustom = custom && v !== '' && !flat.includes(v);
+  const text = h('input', { value: isCustom ? v : '', placeholder: 'Type a value…', hidden: !isCustom, oninput: (e) => onchange(e.target.value) });
+  const opt = (val, lab) => h('option', { value: val }, lab);
+  const sel = h('select', { onchange: (e) => {
+    if (e.target.value === '__custom') { text.hidden = false; text.focus(); onchange(text.value); }
+    else { text.hidden = true; onchange(e.target.value); }
+  } },
+  opt('', emptyLabel),
+  groups ? groups.map((g) => h('optgroup', { label: g.label }, g.options.map(([a, b]) => opt(a, b))))
+    : choices.map((c) => opt(c, labels[c] || c)),
+  custom ? opt('__custom', 'Custom…') : null);
+  sel.value = isCustom ? '__custom' : v;
+  return {
+    el: h('div', { class: 'combo' }, sel, text),
+    reset: () => { sel.value = ''; text.hidden = true; text.value = ''; },
+  };
+}
+
+// Slider + number box. Empty number box = inherited (slider shows the inherited value, dimmed).
+function rangeInput({ range, zero, value, inh, onchange }) {
+  const [min, max, step] = range;
+  const has = value !== '' && value != null;
+  const home = inh ?? min;
+  const fmt = (x) => (zero && Number(x) === 0 ? zero : String(x));
+  const slider = h('input', { type: 'range', min, max, step, class: has ? '' : 'inherited' });
+  slider.value = has ? value : home;
+  const num = h('input', { type: 'number', step, class: 'rnum', placeholder: inh == null ? '' : fmt(inh) });
+  if (has) num.value = value;
+  const hint = h('span', { class: 'faint small rzero' }, zero ? `0 = ${zero}` : '');
+  slider.addEventListener('input', () => {
+    num.value = slider.value; slider.classList.remove('inherited'); onchange(Number(slider.value));
+  });
+  num.addEventListener('input', () => {
+    if (num.value === '') { slider.value = home; slider.classList.add('inherited'); onchange(''); return; }
+    slider.value = num.value; slider.classList.remove('inherited'); onchange(Number(num.value));
+  });
+  return {
+    el: h('div', { class: 'rangebox' }, slider, num, zero ? hint : null),
+    reset: () => { num.value = ''; slider.value = home; slider.classList.add('inherited'); },
+  };
+}
+
+// Multi-select with pills (comma-separated value), options loaded lazily: load() -> [{value, label, detail}].
+function multiSelect({ load, value, placeholder, onchange }) {
+  const parse = (v) => (v ? String(v).split(',').map((s) => s.trim()).filter(Boolean) : []);
+  let selected = parse(value);
+  let options = null;
+  const pills = h('div', { class: 'msel-pills' });
+  const menu = h('div', { class: 'msel-menu', hidden: true });
+  const commit = () => { drawPills(); if (!menu.hidden) drawMenu(); onchange(selected.join(', ')); };
+  const drawPills = () => {
+    pills.innerHTML = '';
+    if (!selected.length) { pills.append(h('span', { class: 'msel-placeholder' }, placeholder)); return; }
+    selected.forEach((v, i) => pills.append(h('span', { class: 'msel-pill', title: v },
+      h('span', { class: 'msel-name' }, v),
+      h('button', { type: 'button', title: 'Remove', onclick: (e) => { e.stopPropagation(); selected.splice(i, 1); commit(); } }, '×'))));
+  };
+  const drawMenu = () => {
+    menu.innerHTML = '';
+    if (!options) { menu.append(h('div', { class: 'muted small', style: { padding: '6px' } }, 'Loading…')); return; }
+    const all = [...options, ...selected.filter((v) => !options.some((o) => o.value === v)).map((v) => ({ value: v, label: v, detail: 'not in the library' }))];
+    if (!all.length) { menu.append(h('div', { class: 'muted small', style: { padding: '6px' } }, 'Nothing to pick yet.')); return; }
+    for (const o of all) {
+      const on = selected.includes(o.value);
+      const cb = h('input', { type: 'checkbox', checked: on, onchange: () => {
+        selected = cb.checked ? [...selected, o.value] : selected.filter((x) => x !== o.value);
+        commit();
+      } });
+      menu.append(h('label', { class: `msel-opt ${on ? 'on' : ''}`, onclick: (e) => e.stopPropagation() },
+        cb, h('span', { class: 'msel-olabel' }, o.label), o.detail ? h('span', { class: 'faint small' }, o.detail) : null));
+    }
+  };
+  const toggle = (e) => {
+    e.stopPropagation();
+    const open = menu.hidden;
+    document.querySelectorAll('.msel-menu').forEach((m) => { m.hidden = true; });
+    menu.hidden = !open;
+    if (open) {
+      drawMenu();
+      if (!options) load().then((o) => { options = o; if (!menu.hidden) drawMenu(); }).catch(() => { options = []; drawMenu(); });
+    }
+  };
+  const trigger = h('div', { class: 'msel-box', tabindex: '0', onclick: toggle, onkeydown: (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(e); } else if (e.key === 'Escape') menu.hidden = true;
+  } }, pills, h('span', { class: 'msel-arrow' }, '▾'));
+  drawPills();
+  return { el: h('div', { class: 'msel' }, trigger, menu), reset: () => { selected = []; drawPills(); if (!menu.hidden) drawMenu(); } };
+}
+
 // Shared editor for a project's recaper.toml and the global settings file.
 // values = keys this file sets; base[key] = what applies when the key is left empty; from[key] = 'global' | 'cwd' (else default).
 function optionsEditor({ schema, values, base, from = {}, skip = [], self = null, intro, onSave, toml = '' }) {
@@ -724,7 +1047,22 @@ function optionsEditor({ schema, values, base, from = {}, skip = [], self = null
     };
     let input;
     let resetUi = null;
-    if (o.kind === 'bool') {
+    const ui = o.ui || {};
+    const labelOf = (x) => (ui.labels && ui.labels[x]) || (ui.groups && ui.groups.flatMap((g) => g.options).find(([a]) => a === x)?.[1]) || x;
+    const emptyLabel = `${src} (${def === '' ? 'auto' : labelOf(def)})`;
+    if ((o.kind === 'int' || o.kind === 'number') && ui.range) {
+      const r = rangeInput({ range: ui.range, zero: ui.zero, value: shown, inh, onchange });
+      input = r.el; resetUi = r.reset;
+    } else if (o.kind === 'projects' && ui.multi) {
+      const ms = multiSelect({
+        value: shown, placeholder: 'None linked - pick library projects', onchange,
+        load: () => api('/api/projects').then((ps) => ps.filter((x) => x.name !== self).map((x) => ({ value: x.name, label: x.name, detail: `${x.chapters} ch` }))),
+      });
+      input = ms.el; resetUi = ms.reset;
+    } else if (o.kind !== 'models' && o.kind !== 'color' && (ui.groups || (o.choices && o.choices.length && o.kind !== 'bool'))) {
+      const cs = comboSelect({ choices: (o.choices || []).map(String), labels: ui.labels || {}, groups: ui.groups, custom: !!ui.custom, emptyLabel, value: shown, onchange });
+      input = cs.el; resetUi = cs.reset;
+    } else if (o.kind === 'bool') {
       const effective = o.key in values ? !!values[o.key] : !!inh;
       const box = h('input', { type: 'checkbox', checked: effective, onchange: (e) => onchange(e.target.checked === !!inh ? '' : e.target.checked) });
       input = h('label', { class: 'check' }, box, h('span', {}, `On (${src.toLowerCase()} ${inh ? 'on' : 'off'})`));
@@ -971,6 +1309,10 @@ async function tabVideosList(p) {
 
 async function tabChapters(p) {
   const status = h('div', { class: 'muted small' });
+  let index = { kind: 'pages', chapters: [] };
+  try { index = await api(`/api/projects/${enc(p.name)}/chapter-index`); } catch { /* listing still works */ }
+  const byTitle = new Map(index.chapters.map((c) => [c.title, c.n]));
+  const total = index.chapters.length;
   const upload = async (files) => {
     if (!files.length) return;
     const fd = new FormData();
@@ -1020,11 +1362,18 @@ async function tabChapters(p) {
     h('div', { class: 'card' }, h('h2', {}, `Chapters (${p.chapter_list.length})`),
       p.chapter_list.length ? h('div', { class: 'tablewrap' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, '#'), h('th', {}, 'Chapter'), h('th', {}, 'Type'), h('th', {}, 'Pages'), h('th', {}, ''))),
         h('tbody', {}, p.chapter_list.map((c, i) => h('tr', {}, h('td', {}, i + 1), h('td', {}, c.title), h('td', {}, h('span', { class: 'chip' }, c.kind)), h('td', {}, c.pages ?? '—'),
-          h('td', { style: { textAlign: 'right' } }, c.file ? h('button', { class: 'small ghost danger', title: 'Delete this chapter', onclick: async () => {
+          h('td', { style: { textAlign: 'right', whiteSpace: 'nowrap' } },
+            index.kind === 'pages' && byTitle.has(c.title) ? h('button', { class: 'small ghost', title: 'Open', onclick: () => openViewer(p.name, byTitle.get(c.title), total) }, '👁 Open') : null,
+            c.file ? h('button', { class: 'small ghost danger', title: 'Delete this chapter', onclick: async () => {
             if (!await confirmModal('Delete chapter', `Delete "${c.title}" from disk? Downloaded chapters can be downloaded again.`)) return;
             try { await api(`/api/projects/${enc(p.name)}/chapters?file=${enc(c.file)}`, { method: 'DELETE' }); toast('Chapter deleted', 'ok'); render(); } catch (e) { toast(e.message, 'bad'); }
           } }, '🗑') : null))))))
-        : h('div', { class: 'empty' }, 'No chapters yet.')));
+        : h('div', { class: 'empty' }, 'No chapters yet.')),
+    index.kind === 'book' && total ? h('div', { class: 'card' }, h('h2', {}, `Book chapters (${total})`),
+      h('p', { class: 'muted small', style: { marginTop: 0 } }, 'How the volumes above were split - these are the chapter numbers the Make tab uses.'),
+      h('div', { class: 'tablewrap' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, '#'), h('th', {}, 'Chapter'), h('th', {}, 'Volume'), h('th', {}, 'Words'), h('th', {}, ''))),
+        h('tbody', {}, index.chapters.map((c) => h('tr', {}, h('td', {}, c.n), h('td', {}, c.title), h('td', { class: 'muted small' }, c.volume),
+          h('td', {}, c.words.toLocaleString()), h('td', { style: { textAlign: 'right' } }, h('button', { class: 'small ghost', onclick: () => openViewer(p.name, c.n, total) }, '👁 Read')))))))) : null);
 }
 
 async function tabImages(p) {

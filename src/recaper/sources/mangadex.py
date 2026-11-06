@@ -128,7 +128,7 @@ class MangaDex(Connector):
         offset: int = 0,
         sort: str = "relevance",
         availability: str = "any",
-        nsfw: bool = False,
+        nsfw: bool = True,
     ) -> list[MangaInfo]:
         m = UUID.search(query or "")
         if m:  # pasted a MangaDex URL / id

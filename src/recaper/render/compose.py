@@ -168,7 +168,7 @@ def blurred_cover(img: np.ndarray, w: int, h: int, overscan: float = 1.12, blur:
     small_w, small_h = max(8, int(img.shape[1] * s / 8)), max(8, int(img.shape[0] * s / 8))
     small = cv2.resize(img, (small_w, small_h), interpolation=cv2.INTER_AREA)
     small = cv2.GaussianBlur(small, (0, 0), blur) if blur > 0 else small
-    big = cv2.resize(small, (int(img.shape[1] * s), int(img.shape[0] * s)), interpolation=cv2.INTER_LINEAR)
+    big = cv2.resize(small, (max(W, math.ceil(img.shape[1] * s)), max(H, math.ceil(img.shape[0] * s))), interpolation=cv2.INTER_LINEAR)  # never 1 px short
     y0 = (big.shape[0] - H) // 2
     x0 = (big.shape[1] - W) // 2
     big = big[y0 : y0 + H, x0 : x0 + W].astype(np.float32)

@@ -24,8 +24,13 @@ uv run recaper ui -L D:\recaps       # any library folder (one sub-folder per se
 - **Download**: search a source, pick a language, select chapters (all / range / not downloaded, per-chapter
   scanlation group, preferred group), choose the project folder and image quality. You can **make the video
   automatically when the download finishes**. Re-downloading skips chapters already on disk.
-- **Project → Make video**: stop after any stage, redo stages, panel previews, output name, a live progress bar
-  per stage, a streaming log, and Stop (kills the whole run, including render/voice workers).
+- **Project → Make video**: pick the **chapters** to make the video from (tick, shift-click a range, or type
+  `1-5,8`; cached chapters show as read / script), stop after any stage, redo stages, panel previews, output
+  name, quick preview, a live progress bar per stage, a streaming log, and Stop (kills the whole run, including
+  render/voice workers). A chapter subset is saved as `<title>_ch1-5_recap.mp4`, so it never overwrites the full
+  video.
+- **Chapter viewer** (👁 in the Make and Chapters tabs): read any chapter in the browser, as a webtoon strip or
+  page by page (← → or click the page edges, Esc closes). Books show the chapter text with its illustrations.
 - **Settings**: general options for **every project** (models, language, voice, look, image generator…),
   saved to `~/.recaper.toml`. Per-series options (title, chapters, image sources) stay on the project.
 - **Project → Options**: *every* setting (generated from the config, so none are missing), with help text.
@@ -55,7 +60,7 @@ connector for unofficial aggregator sites, and none that bypasses site protectio
 | **Pepper&Carrot** | David Revoy's open webcomic, 39 episodes in 70+ languages | n/a | everything (**CC-BY 4.0**, credit required) | n/a |
 
 **Filters in the Download page:** search or browse with an empty query, sort, *Show* (Everything /
-Downloadable here / Copyright-free), and **NSFW / 18+**. NSFW is off by default; when on, adult works appear
+Downloadable here / Copyright-free), and **NSFW / 18+**. NSFW is on by default (untick it to hide adult works); adult works appear
 with an 18+ label and covers are never blurred.
 
 **Why "copyright-free" is strict:** archive.org licence *and* date fields are typed in by uploaders and are
@@ -98,8 +103,16 @@ source). Projects that are mostly prose switch to book mode automatically; you c
    matches each book chapter to the adaptation chapters showing the same events, and the writer picks
    fitting panels beat by beat.
 4. **Generation for the gaps.** When no image fits a key moment, the writer describes the scene and
-   `images.generator` (`gemini` or `openai`) draws it. The work's own art (illustrations, linked panels,
-   cover) is sent as style and character references. The budget (`images.max_generated`) is spread across
+   `images.generator` draws it. The work's own art (illustrations, linked panels, cover) is sent as style and
+   character references. Generators:
+   - `antigravity`: your Google AI plan through Antigravity, **no API key**. It uses the agent's built-in
+     `generate_image` tool; that tool is the only one recaper allows, everything else is refused. About a minute
+     per image, 4 at a time. The tool can't take reference images, so the model describes their style in words:
+     the style matches well, faces less exactly than the API generators.
+   - `gemini` (`GEMINI_API_KEY`, about $0.04 per image) and `openai` (`OPENAI_API_KEY`) see the references
+     directly.
+
+    The budget (`images.max_generated`) is spread across
    chapters, and results are cached. With the generator off or out of budget, each beat uses the closest
    real picture from its chapter. A title card is the last resort.
 
@@ -115,8 +128,33 @@ Everything is in the UI's Options tab (and `recaper.toml`). Beyond story, models
   together), card border, shadow strength, camera motion, hit effect, animation speed, frame fill, max
   upscale, background blur and brightness.
 - **Story:** cold-open hook on/off, hook length, and a closing line voiced over the last panel.
+- **Polish pass** (`polish`, on by default): after writing, one extra writer call per chapter line-edits the
+  script. A local checker first lists what to fix: speech reported in the present ("he tells her"), sentences
+  that keep opening with the same word, repeated phrases, too few "but / however" turns, sentences over 35
+  words, more than one rhetorical question. The model also checks names against the story bible. Panels,
+  emphasis and beat count never change, and a rewritten line that lost or invented too much is ignored.
+  Results are cached.
+- **Parts** (`episode_minutes`, CLI `--parts 15`): long recaps become `_part01.mp4`, `_part02.mp4`… made of
+  whole chapters. A short last stretch joins the previous part. Parts 2+ open with a ~25 s "previously on"
+  (`previously`) written from the earlier parts' script and illustrated with their key panels.
+- **Quick preview** (UI ⚡ button, CLI `--quick`): the first ~60 s at 480p, rendered in seconds, to judge
+  look, voice and pacing. Its audio is reused by the full run.
+- **Panel upscaler** (`render.upscaler`, default `auto`): panels shown enlarged are upscaled once with
+  Real-ESRGAN (anime model, CUDA GPU, ~0.1 s per panel, cached in `.recaper/upscaled/`), so they fill the
+  frame without going soft. `fast` looks natural; `quality` gives crisper lines but can over-sharpen. Needs
+  `uv sync --extra kokoro` (or `--extra upscale`); the model (2.5 MB) downloads on first use.
 - **Panel slicing:** manhwa gutter size, minimum panel height, maximum panel ratio, and the manga background
   level. Changing these re-cuts and re-reads only the affected chapters.
+
+## Usage & cost
+
+Every run logs its model calls (per provider: ok / quota hit / refused / error, panel images sent, text in
+and out, time), generated images, newly voiced lines, upscaled panels and renders to `.recaper/usage.jsonl`.
+The project's **Usage** tab shows each run. It also shows an estimate of the next full run, counting only
+what isn't cached: reader calls and panel images, writer calls, the most images that could be generated
+(with a $ estimate for API generators), voice words, parts. Providers are tagged *plan / free*
+(Claude or Antigravity subscriptions, Gemini CLI, OpenCode free, Ollama) or *API-billed* (API keys). The Make
+tab shows the same estimate in one line.
 
 ## Pipeline
 
@@ -132,8 +170,15 @@ Every stage resumes from cache. Edit `.recaper/script.json` (text, panels, empha
 
 **Speed** (5 chapters / ~300 panels → 16 min video, RTX 5070, Claude via subscription): about 3½ minutes from scratch.
 Chapters are read and written in parallel (`--jobs`, default 6; chapter 1 is read first to seed the cast, then a
-single call reconciles character names), Kokoro voices in 3 GPU worker processes, and frames render in 8 processes
-into NVENC (settled frames are one cached composition + one camera warp).
+single call reconciles character names), and each chapter is polished as soon as it is written. Kokoro voices in
+3 GPU worker processes; a video split into parts is voiced in one batch, so the model loads once.
+
+Rendering, on an RTX 5070 at 1080p30: blurfill **~22x real time** (~600 fps), motion **~17x** (~510 fps). Frames
+are composed **on the GPU** (`render/gpu.py`). The camera warp, cards, shadows, cross-fades and the I420
+conversion all run on the device, and each worker only downloads finished 3 MB frames and pipes them to NVENC
+(preset p1, which measured the same quality as p3 at CQ 21). The 8 render workers start while the narration is
+voiced and are reused across parts. Chunks are 40 s, and the audio is mastered while the video renders. Without
+CUDA the same frames are composed on the CPU, about 2x slower; `RECAPER_GPU_WARP=0` forces that path.
 
 **Quota:** reading sends every panel image to the reader model. A long series can use up a Claude plan's 5-hour
 window; recaper detects the cap, falls back to the next provider in the chain, or stops with the reset time. All
@@ -180,6 +225,8 @@ recaper run ./series --reader claude --writer deepseek-free,claude
 --until panels|read|script|voice|render      stop early (e.g. review script.json)
 --force script            redo a stage (repeatable)
 --preview                 write panel contact sheets to .recaper/preview/
+--quick                   quick preview: first ~60 s at 480p -> <title>_recap_preview.mp4
+--parts 15                split into ~15-minute parts with a "previously on" intro
 --jobs 6                  parallel model calls for reading / writing
 --fps 60 --resolution 2560x1440 --encoder x264 --workers 8
 ```

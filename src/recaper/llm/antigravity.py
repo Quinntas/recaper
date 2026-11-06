@@ -134,6 +134,7 @@ class _Server:
         self._next = 0
         self._pending: dict[int, queue.Queue] = {}
         self._sessions: dict[str, queue.Queue] = {}
+        self._allow: dict[str, set[str]] = {}  # session -> tool names it may run (image generation only)
         self.stderr: deque[str] = deque(maxlen=60)
         threading.Thread(target=self._read_out, daemon=True).start()
         threading.Thread(target=self._read_err, daemon=True).start()
@@ -174,9 +175,16 @@ class _Server:
                 q = self._sessions.get(msg["params"].get("sessionId"))
                 if q:
                     q.put(msg["params"]["update"])
-            elif "id" in msg:  # the agent asks us something: refuse everything
+            elif "id" in msg:  # the agent asks us something: refuse everything not explicitly allowed
                 if msg["method"] == "session/request_permission":
                     reply = {"result": {"outcome": {"outcome": "cancelled"}}}
+                    params = msg.get("params") or {}
+                    allowed = self._allow.get(params.get("sessionId"), set())
+                    call = params.get("toolCall") or {}
+                    name = str(call.get("title") or "").lower()
+                    option = next((o for o in params.get("options") or [] if o.get("kind") == "allow_once"), None)
+                    if option and any(t in name for t in allowed):  # e.g. "Run generate_image?"
+                        reply = {"result": {"outcome": {"outcome": "selected", "optionId": option["optionId"]}}}
                 else:
                     reply = {"error": {"code": -32601, "message": "not supported by recaper"}}
                 try:
@@ -228,6 +236,7 @@ class _Server:
 
     def end_session(self, sid: str) -> None:
         self._sessions.pop(sid, None)
+        self._allow.pop(sid, None)
         acp = self.home / "antigravity-acp"
         for ext in (".db", ".db-shm", ".db-wal", ".meta"):
             try:
@@ -364,6 +373,76 @@ class AntigravityProvider(Provider):
                 return text
             finally:
                 srv.end_session(sid)
+
+
+# ------------------------------------------------------------------ image generation
+
+IMAGE_TOOL = "generate_image"
+IMAGE_INSTRUCTIONS = (
+    "You are used by an automated program as an image generator. Call the generate_image tool exactly once, "
+    "with AspectRatio \"16:9\". Do not call any other tool and do not ask questions. Write the tool's Prompt yourself "
+    "from the scene below: keep every detail of the scene, and when reference images are attached, describe their "
+    "art style (line art, colouring, shading, palette, era) and the look of the characters precisely, because the "
+    "tool cannot see the references. No text, captions, speech bubbles or watermarks in the image. "
+    "After the tool finishes, reply only with the word DONE."
+)
+
+
+def _file_uri_path(uri: str) -> Path:
+    """file://C:/x.jpg or file:///C:/x.jpg (Windows), file:///home/x.jpg (POSIX) -> Path."""
+    from urllib.parse import unquote
+
+    raw = unquote(uri[len("file:"):])
+    return Path(raw.lstrip("/") if os.name == "nt" else "/" + raw.lstrip("/"))
+
+
+def generate_image(prompt: str, refs: Sequence[Path], dest: Path, model: str | None = None, timeout: float = 420) -> Path:
+    """Draw one 16:9 image with the agent's built-in generate_image tool (Google AI plan, no API key).
+
+    Only that tool is allowed in the session. Reference images go to the model, which carries their style into the
+    tool prompt in words (the tool itself takes no images). Returns `dest` (the file the tool produced, copied)."""
+    srv = _get_server()
+    with srv._sem:
+        sid, updates = srv.new_session()
+        srv._allow[sid] = {IMAGE_TOOL}
+        try:
+            if model:
+                srv.request("session/set_model", {"sessionId": sid, "modelId": resolve_model(model, [m["modelId"] for m in srv.models])}, timeout=60)
+            parts: list[dict] = [{"type": "text", "text": f"{IMAGE_INSTRUCTIONS}\n\nSCENE:\n{prompt}"}]
+            for r in refs:
+                parts.append({"type": "image", "mimeType": "image/jpeg", "data": ImagePart(Path(r)).b64()})
+            srv.request("session/prompt", {"sessionId": sid, "prompt": parts}, timeout=timeout)
+            made: list[Path] = []
+            texts: list[str] = []
+            while True:
+                try:
+                    u = updates.get_nowait()
+                except queue.Empty:
+                    break
+                if u.get("sessionUpdate") == "agent_message_chunk" and (u.get("content") or {}).get("type") == "text":
+                    texts.append(u["content"]["text"])
+                content = u.get("content")
+                for c in content if isinstance(content, list) else []:  # tool_call_update: [{type: content, content: {...}}]
+                    inner = c.get("content") or {}
+                    uri = str(inner.get("uri") or "")
+                    if inner.get("type") == "image" and uri.startswith("file:"):
+                        made.append(_file_uri_path(uri))
+            made = [m for m in made if m.is_file()]
+            if not made:
+                brain = srv.home / "antigravity-acp" / "brain" / sid
+                made = sorted((f for f in brain.glob("*") if f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")), key=lambda f: f.stat().st_mtime)
+            if not made:
+                detail = "".join(texts).strip() or srv.last_error()
+                if is_refusal_message(detail):
+                    raise RefusalError(f"antigravity image refused: {detail[:200]}")
+                if is_quota_message(detail):
+                    raise QuotaError(f"antigravity: {detail[:200]}")
+                raise ProviderError(f"antigravity produced no image ({detail[:200]})")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(made[-1], dest)
+            return dest
+        finally:
+            srv.end_session(sid)
 
 
 def _main() -> None:  # python -m recaper.llm.antigravity  -> list models

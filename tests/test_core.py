@@ -528,6 +528,9 @@ class _BookModel(Provider):
         if "recap videos of light novels" in system:
             return json.dumps({"beats": [{"text": "Kai swings.", "panels": ["R1"]}, {"text": "A huge gate opens.", "panels": [], "generate": "a gate in the sky"},
                                          {"text": "Then silence.", "panels": []}]})
+        if "line editor of a recap video" in system:  # polish: same beats, small edits
+            beats = _re.findall(r"^\d+\. (.*)$", text.split("BEATS:")[1], _re.M)
+            return json.dumps({"texts": [b.replace("swings", "swung his blade") for b in beats]})
         raise AssertionError(f"unexpected prompt: {system[:60]}")
 
 
@@ -700,3 +703,201 @@ def test_refusal_skips_retries_keeps_provider_alive_and_splits_book_chapter():
     assert len(res["events"]) >= 2 and "Part summary." in res["summary"]
 
 
+
+
+# ------------------------------------------------------- polish, parts, preview, usage, upscaler, antigravity
+
+
+def _beats(texts, prefix="c0001-p"):
+    return [{"text": t, "panels": [f"{prefix}{i:03d}"], "emphasis": "normal"} for i, t in enumerate(texts)]
+
+
+def test_style_checks_and_polish_keeps_panels(tmp_path):
+    from recaper.story import polish_chapter, style_checks
+
+    draft = _beats(["Jin tells her that he is fine and walks away from the gate.", "He looks back.", "He sees the gate.",
+                    "He feels cold.", "He runs.", "Why? How?"])
+    checks = style_checks(draft, "en")
+    assert any("present" in c for c in checks) and any("questions" in c for c in checks) and any('"he"' in c for c in checks)
+    assert style_checks(draft, "pt") and not any("present" in c for c in style_checks(draft, "pt"))  # English-only checks skipped
+
+    fixed = ["Jin told her that he was fine and walked away from the gate.", "But he looked back.", "The gate was still there.",
+             "A chill ran through him.", "So he ran.", "What was waiting inside?"]
+    model = _Fake("ed", json.dumps({"texts": fixed}))
+    cfg = Config()
+    out = polish_chapter(draft, "Ch 1", Bible(), Chain([model], "writer"), cfg, tmp_path)
+    assert [b["text"] for b in out] == fixed and [b["panels"] for b in out] == [b["panels"] for b in draft]
+    assert polish_chapter(draft, "Ch 1", Bible(), Chain([model], "writer"), cfg, tmp_path) == out and model.calls == 1  # cached
+    # wrong count -> keep the draft; a beat that lost most of its words -> keep that beat
+    bad = _Fake("ed", json.dumps({"texts": fixed[:3]}))
+    assert polish_chapter(draft, "Ch 2", Bible(), Chain([bad], "writer"), Config(lang="es"), tmp_path) == draft
+    short = _Fake("ed", json.dumps({"texts": ["Jin left."] + fixed[1:]}))
+    res = polish_chapter(draft, "Ch 3", Bible(), Chain([short], "writer"), Config(extra_instructions="x"), tmp_path)
+    assert res[0]["text"] == draft[0]["text"] and res[1]["text"] == fixed[1]
+
+
+def _script(n_chapters, words_per_beat=50, beats=6):
+    text = " ".join(["word"] * words_per_beat)
+    return {"title": "T", "lang": "en", "hook": _beats(["Hook " + text], "c0001-h"),
+            "chapters": [{"cid": f"c{i:04d}", "title": f"Ch {i}", "beats": _beats([text] * beats, f"c{i:04d}-p")} for i in range(1, n_chapters + 1)]}
+
+
+def test_parts_split_whole_chapters_with_previously(tmp_path, monkeypatch):
+    from recaper import pipeline
+
+    cfg = Config(episode_minutes=3.0, words_per_minute=200)  # each chapter = 300 words = 1.5 min
+    project = pipeline.Project(tmp_path, cfg)
+    assert len(project.parts(_script(2))) == 1  # 3.25 min total: under the 1.25x slack
+    model = _Fake("w", json.dumps({"beats": [{"text": "Previously, Jin entered the gate.", "panels": ["c0002-p005"]},
+                                             {"text": "Nobody came back.", "panels": ["nope"]}]}))
+    monkeypatch.setattr(pipeline, "make_chain", lambda spec, role, need_vision: Chain([model], role))
+    parts = project.parts(_script(7))
+    assert [len(p["chapters"]) for p in parts] == [2, 1, 2, 2]  # 10.5 min / 3 -> 4 balanced parts, whole chapters
+    assert [c["cid"] for p in parts for c in p["chapters"]] == [f"c{i:04d}" for i in range(1, 8)]
+    assert parts[0]["hook"][0]["text"].startswith("Hook") and parts[0]["intro_title"] == "Intro"
+    assert parts[1]["intro_title"] == "Previously" and parts[1]["hook"][0]["panels"] == ["c0002-p005"]
+    assert parts[1]["hook"][1]["panels"]  # unknown panel id replaced by a valid earlier one
+    calls = model.calls
+    project.parts(_script(7))
+    assert model.calls == calls  # previously-on beats are cached
+    project.cfg.previously = False
+    assert project.parts(_script(7))[1]["hook"] == []
+
+
+def test_preview_script_takes_the_first_minute(tmp_path):
+    from recaper import pipeline
+
+    project = pipeline.Project(tmp_path, Config(words_per_minute=200))
+    prev = project.preview_script(_script(5), seconds=60)  # budget 200 words: hook 51 + 3 beats of 50
+    words = sum(len(b["text"].split()) for c in [{"beats": prev["hook"]}, *prev["chapters"]] for b in c["beats"])
+    assert 200 <= words < 260 and len(prev["chapters"]) == 1 and prev["hook"]
+
+
+def test_usage_log_summary_and_estimate(tmp_path):
+    from recaper import usage
+
+    work = tmp_path / ".recaper"
+    usage.record("llm", provider="x")  # not started: no-op
+    assert not (work / "usage.jsonl").exists()
+    usage.start(work, until="render")
+    chain = Chain([_Fake("claude", exc=QuotaError("5-hour limit")), _Fake("openai", '{"ok": 1}')], "writer")
+    assert chain.complete_json("s", ["hello"]) == {"ok": 1}
+    usage.record("image", provider="gemini", outcome="ok", seconds=3)
+    usage.record("end", status="done", outputs=["t_recap.mp4"])
+    usage.stop()
+    runs = usage.summarize(usage.read(work))
+    assert len(runs) == 1 and runs[0]["status"] == "done" and runs[0]["outputs"] == ["t_recap.mp4"]
+    llm = runs[0]["llm"]
+    assert llm["claude"]["quota"] == 1 and llm["openai"]["ok"] == 1 and llm["openai"]["billing"] == "api"
+    assert llm["claude"]["billing"] in ("plan", "api") and runs[0]["images"]["ok"] == 1
+
+    (tmp_path / "Ch 1").mkdir()
+    cfg = Config(minutes_per_chapter=2.0, episode_minutes=2.0)
+    est = usage.estimate(tmp_path, cfg, [{"title": "Ch 1", "pages": 10}, {"title": "Ch 2", "pages": 10}], is_book=False)
+    assert est["chapters"] == 2 and est["unread"] == 2 and est["reader"]["images"] == 60
+    assert est["reader"]["calls"] == 2 * 1 and est["writer"]["calls"] == 2 * 2 + 1 + 1 + 1  # write+polish, bible, hook, previously
+    assert est["video"]["parts"] == 2
+
+
+def test_upscaler_targets_only_enlarged_panels(tmp_path):
+    from recaper.upscale import resolve_mode, target_scale, upscale_panels
+
+    assert target_scale(1920, 1080, 1920, 1080) == 1.0 and target_scale(720, 1164, 1920, 1080) == 1.0
+    assert target_scale(640, 360, 1920, 1080) == 3.6 and target_scale(100, 100, 1920, 1080) == 4.0
+    assert resolve_mode("off")[0] is None and resolve_mode("bogus")[0] is None
+    meta = {"a": {"file": "panels/a.jpg", "w": 640, "h": 360}}
+    assert upscale_panels(meta, tmp_path, 1920, 1080, "off") == meta
+
+
+def test_antigravity_permission_filter_allows_only_listed_tools():
+    import io
+    import queue as _q
+
+    from recaper.llm import antigravity as agy
+
+    srv = agy._Server.__new__(agy._Server)
+    srv._pending, srv._sessions, srv._allow = {}, {}, {"s1": {"generate_image"}}
+    sent = []
+    srv._send = sent.append
+
+    def ask(sid, title):
+        return json.dumps({"jsonrpc": "2.0", "id": len(sent) + 1, "method": "session/request_permission", "params": {
+            "sessionId": sid, "toolCall": {"title": title},
+            "options": [{"optionId": "always", "kind": "allow_always"}, {"optionId": "once", "kind": "allow_once"}, {"optionId": "no", "kind": "reject_once"}]}})
+
+    srv.proc = type("P", (), {"stdout": io.StringIO("\n".join([
+        ask("s1", "Run generate_image?"), ask("s1", "Run write_to_file?"), ask("s2", "Run generate_image?"), ask("s1", "Run run_command?")]) + "\n")})()
+    srv._read_out()
+    outcomes = [m["result"]["outcome"] for m in sent]
+    assert outcomes[0] == {"outcome": "selected", "optionId": "once"}
+    assert all(o == {"outcome": "cancelled"} for o in outcomes[1:])
+    assert agy._file_uri_path("file:///C:/x/a%20b.jpg").name == "a b.jpg"
+    assert isinstance(_q.Queue(), _q.Queue)
+
+
+def test_chapter_index_viewer_and_run_selection(samples, tmp_path, monkeypatch):
+    import shutil as _sh
+
+    from fastapi.testclient import TestClient
+
+    from recaper import pipeline
+    from recaper.web.server import create_app
+
+    _sh.copytree(samples / "manga", tmp_path / "Manga")
+    book = tmp_path / "Book"
+    book.mkdir()
+    body = " ".join(["Kai walks to the station and waits for the last train."] * 30)
+    (book / "Vol 1.txt").write_text(f"Chapter 1: Train\n{body}\n\nChapter 2: Office\n{body}\n\nChapter 3: Gate\n{body}\n", "utf-8")
+    (book / "recaper.toml").write_text('[book]\nmin_words = 50\n', "utf-8")
+    c = TestClient(create_app(tmp_path))
+
+    idx = c.get("/api/projects/Manga/chapter-index").json()
+    assert idx["kind"] == "pages" and [x["n"] for x in idx["chapters"]] == list(range(1, len(idx["chapters"]) + 1))
+    assert idx["selected"] == [x["n"] for x in idx["chapters"]] and not idx["chapters"][0]["read"]
+    view = c.get("/api/projects/Manga/chapter-view/1").json()
+    assert view["pages"] and c.get(view["pages"][0]).status_code == 200
+    assert c.get("/api/projects/Manga/chapter-view/99").status_code == 404
+    assert c.get("/api/projects/Manga/file/..%2FBook%2FVol%201.txt").status_code == 404  # viewer files stay in the project
+
+    bidx = c.get("/api/projects/Book/chapter-index").json()
+    assert bidx["kind"] == "book" and [x["title"] for x in bidx["chapters"]] == ["Chapter 1: Train", "Chapter 2: Office", "Chapter 3: Gate"]
+    bview = c.get("/api/projects/Book/chapter-view/2").json()
+    assert bview["kind"] == "book" and bview["paragraphs"] and "Kai walks" in bview["paragraphs"][-1]
+
+    calls = []
+    monkeypatch.setattr("recaper.web.jobs.JobManager.run_pipeline", lambda self, *a, **k: calls.append(a) or type("J", (), {"view": lambda s: {"id": "x"}})())
+    assert c.post("/api/projects/Manga/run", json={"chapters": "1-2,4"}).status_code == 200 and calls[-1][-1] == "1-2,4"
+    assert c.post("/api/projects/Manga/run", json={"chapters": "1; rm -rf /"}).status_code == 400
+
+    proj = pipeline.Project(tmp_path / "Manga", Config(chapters="2"))
+    proj.stage_panels()
+    assert proj.default_output().name == "manga_ch2_recap.mp4"
+    proj_all = pipeline.Project(tmp_path / "Manga", Config())
+    proj_all.stage_panels()
+    assert proj_all.default_output().name == "manga_recap.mp4"
+
+
+def test_gpu_frames_match_cpu(samples):
+    import cv2
+
+    from recaper.render import gpu as G
+    from recaper.render.styles import panel_infos
+
+    dev = G.get()
+    if dev is None:
+        pytest.skip("no CUDA GPU")
+    chapters = discover(samples / "manhwa", samples / "manhwa" / ".recaper")
+    panels = extract_chapter(chapters[0], "manhwa", False, samples / "manhwa" / ".recaper")
+    meta = {p.id: {"file": p.file, "w": p.w, "h": p.h} for p in panels[:4]}
+    infos = panel_infos(meta, samples / "manhwa" / ".recaper")
+    ids = list(meta)
+    timed = [{"start": 0, "end": 3, "panels": ids[:2], "emphasis": "normal"}, {"start": 3, "end": 6, "panels": ids[2:4], "emphasis": "hit"}]
+    for style_cls in (MotionStyle, BlurFillStyle):
+        st = style_cls(640, 360, infos)
+        shots = build_shots(timed, style_cls.name)
+        for k, (sh, t) in enumerate([(shots[0], 0.1), (shots[0], 2.5), (shots[-1], 0.05), (shots[-1], 2.0)]):
+            prev = shots[shots.index(sh) - 1] if shots.index(sh) else None
+            g = st.frame_gpu(dev, sh, prev, t)
+            cpu = cv2.cvtColor(st.frame(sh, prev, t), cv2.COLOR_BGR2YUV_I420).ravel()
+            diff = np.abs(dev.to_i420(g).astype(int) - cpu.astype(int))
+            assert diff.mean() < 1.0, (style_cls.name, k, diff.mean())

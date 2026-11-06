@@ -9,6 +9,7 @@ Everything is cached under the work dir so runs are resumable:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -362,3 +363,85 @@ def positions(n: int) -> list[str]:
     if n == 1:
         return ["only"]
     return ["first"] + ["middle"] * (n - 2) + ["last"]
+
+
+# ------------------------------------------------------------------ polish pass
+
+_PRESENT_SPEECH = re.compile(
+    r"\b(?:he|she|they|it|[A-Z][a-z]+)\s+(tells|asks|says|explains|replies|answers|shouts|whispers|thinks|realizes|realises|wonders|admits|insists|warns|promises|mutters|yells|declares)\b"
+)
+_TURNS = re.compile(r"^(but|however|yet|unfortunately|little did|then again|instead|still|meanwhile|suddenly|just as|only)\b", re.I)
+
+
+def _sentences(text: str) -> list[str]:
+    return [s.strip() for s in re.split(r"(?<=[.!?…])\s+", text) if s.strip()]
+
+
+def style_checks(beats: list[dict], lang: str) -> list[str]:
+    """Cheap, deterministic findings handed to the polish model (English-specific checks only for English)."""
+    out: list[str] = []
+    sents = [s for b in beats for s in _sentences(b["text"])]
+    if not sents:
+        return out
+    long = [s for s in sents if len(s.split()) > 35]
+    if long:
+        out.append(f"{len(long)} sentence(s) over 35 words, e.g. \"{long[0][:90]}…\"")
+    questions = sum(s.endswith("?") for s in sents)
+    if questions > 1:
+        out.append(f"{questions} rhetorical questions (max 1, only as the final cliffhanger)")
+    if not lang.lower().startswith("en"):
+        return out
+    present = sorted({m.group(0) for b in beats for m in _PRESENT_SPEECH.finditer(b["text"])})
+    if present:
+        out.append("speech/thought reported in the present: " + ", ".join(f'"{p}"' for p in present[:8]))
+    openers: dict[str, int] = {}
+    for s in sents:
+        w = re.sub(r"[^\w']", "", s.split()[0]).lower() if s.split() else ""
+        if w and w not in ("the", "a", "an"):
+            openers[w] = openers.get(w, 0) + 1
+    rep = [f'"{w}" x{n}' for w, n in sorted(openers.items(), key=lambda x: -x[1]) if n >= max(3, len(sents) // 6)]
+    if rep:
+        out.append("sentences repeatedly open with " + ", ".join(rep[:5]))
+    turns = sum(bool(_TURNS.match(s)) for s in sents)
+    if len(sents) >= 9 and turns < len(sents) / 6:
+        out.append(f"only {turns} turn(s) in {len(sents)} sentences (aim for about one every three)")
+    words: dict[str, int] = {}
+    for b in beats:
+        for phrase in re.findall(r"\b(?:\w+\s){2}\w+\b", b["text"].lower()):
+            words[phrase] = words.get(phrase, 0) + 1
+    tics = [p for p, n in words.items() if n >= 3 and not re.match(r"^(of the|in the|to the|and the|on the|at the)", p)]
+    if tics:
+        out.append("repeated phrases: " + ", ".join(f'"{t}"' for t in tics[:5]))
+    return out
+
+
+def polish_chapter(beats: list[dict], title: str, bible: Bible, writer: Chain, cfg: Config, cache_dir: Path) -> list[dict]:
+    """Line-edit one chapter's beat texts (panels, emphasis and count untouched). Cached by content."""
+    if len(beats) < 2:
+        return beats
+    blob = json.dumps([[b["text"] for b in beats], cfg.lang, cfg.extra_instructions, bible.text(), prompts.POLISH_SYSTEM], ensure_ascii=False)
+    path = cache_dir / f"polish_{hashlib.sha1(blob.encode()).hexdigest()[:16]}.json"
+    if path.exists():
+        texts = json.loads(path.read_text("utf-8"))["texts"]
+    else:
+        checks = style_checks(beats, cfg.lang)
+        numbered = "\n".join(f"{i}. {b['text']}" for i, b in enumerate(beats, start=1))
+        user = prompts.polish_user(cfg.lang, bible.text(), title, numbered, "\n".join(f"- {c}" for c in checks), cfg.extra_instructions)
+        try:
+            res = writer.complete_json(prompts.POLISH_SYSTEM, [user])
+        except Exception as e:  # noqa: BLE001 - polishing is optional; keep the draft
+            console.print(f"[yellow]polish skipped for {title}: {e}[/]")
+            return beats
+        texts = res.get("texts") if isinstance(res, dict) else None
+        if not isinstance(texts, list) or len(texts) != len(beats):
+            console.print(f"[yellow]polish for {title} returned {len(texts) if isinstance(texts, list) else 'no'} texts for {len(beats)} beats; keeping the draft[/]")
+            return beats
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"texts": texts, "checks": style_checks(beats, cfg.lang)}, ensure_ascii=False, indent=1), "utf-8")
+    out = []
+    for b, t in zip(beats, texts):
+        t = _clean_text(str(t or ""))
+        n0, n1 = len(b["text"].split()), len(t.split())
+        ok = t and 0.6 * n0 - 3 <= n1 <= 1.5 * n0 + 5  # a rewrite that lost or invented content is ignored
+        out.append({**b, "text": t} if ok else b)
+    return out

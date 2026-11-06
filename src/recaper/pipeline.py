@@ -13,7 +13,7 @@ import re
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -151,7 +151,7 @@ class Project:
         key = self._selection_key()
         # hook/outro only affect assembly: they must not invalidate the (expensive) chapter scripts
         assembly = key + hashlib.sha1(
-            json.dumps([self.cfg.hook, self.cfg.hook_words, self.cfg.outro, self.cfg.image_sources, asdict(self.cfg.images)]).encode()
+            json.dumps([self.cfg.hook, self.cfg.hook_words, self.cfg.outro, self.cfg.image_sources, asdict(self.cfg.images), self.cfg.polish]).encode()
         ).hexdigest()[:6]
         if script_path.exists():
             existing = json.loads(script_path.read_text("utf-8"))
@@ -181,6 +181,8 @@ class Project:
             if res is None:
                 return {}
             hook, chapters_out = res
+        if self.cfg.polish and self.source == "book":  # manga/manhwa chapters are polished as they are written
+            hook, chapters_out = self._polish(hook, chapters_out, writer)
         if self.cfg.outro.strip() and chapters_out and chapters_out[-1]["beats"]:
             last = chapters_out[-1]["beats"][-1]
             chapters_out[-1]["beats"] = [*chapters_out[-1]["beats"], {"text": self.cfg.outro.strip(), "panels": last["panels"][-1:], "emphasis": "normal"}]
@@ -200,6 +202,29 @@ class Project:
         )
         return script
 
+
+    def _polish(self, hook: list[dict], chapters_out: list[dict], writer) -> tuple[list[dict], list[dict]]:
+        """Editing pass: one cached call per chapter fixes tics, tense slips, missing turns and name drift."""
+        from .story import polish_chapter
+
+        bible = Bible()
+        bpath = self.work / "bible.json"
+        if bpath.exists():
+            data = json.loads(bpath.read_text("utf-8"))
+            bible.characters, bible.terms = data.get("characters", []), data.get("terms", {})
+        t0 = time.time()
+        units = [("Intro", hook)] + [(c["title"], c["beats"]) for c in chapters_out]
+        console.print(f"[bold]polishing[/] {len(units)} sections with {writer.describe()}")
+        progress.emit("script", 0, len(units), "polishing")
+        out: list = [None] * len(units)
+        with ThreadPoolExecutor(max(1, self.cfg.jobs)) as pool:
+            futs = {pool.submit(polish_chapter, beats, title, bible, writer, self.cfg, self.work / "script"): i
+                    for i, (title, beats) in enumerate(units)}  # fmt: skip
+            for k, f in enumerate(as_completed(futs), start=1):
+                out[futs[f]] = f.result()
+                progress.emit("script", k, len(units), "polished")
+        console.print(f"  polished in {time.time() - t0:.0f}s")
+        return out[0], [{**c, "beats": b} for c, b in zip(chapters_out, out[1:])]
 
     def _manga_script(self, reader, writer, key: str, until_read: bool):
         """Manga / manhwa: read panels -> notes -> beats. Returns (hook, chapters) or None after reading."""
@@ -234,18 +259,25 @@ class Project:
         targets = chapter_word_targets(all_notes, self.cfg)
         pos = positions(len(all_notes))
         script_dir = self.work / "script"
+        from .story import polish_chapter
+
+        def polished(beats: list[dict], title: str) -> list[dict]:
+            return polish_chapter(beats, title, bible, writer, self.cfg, script_dir) if self.cfg.polish else beats
+
+        def hook_job() -> list[dict]:
+            return polished(write_hook(all_notes, bible, writer, self.cfg, script_dir / f"hook_{key}_{self.cfg.hook_words}.json"), "Intro")
+
+        def chapter_job(i: int, notes: dict, words: int, position: str) -> list[dict]:
+            beats = write_chapter(notes, position, story_before(all_notes, i), previous_context(all_notes, i), words, bible, writer,
+                                  self.cfg, script_dir / f"{notes['cid']}_{position}_{words}_{self.cfg.lang}_{key}.json")  # fmt: skip
+            return polished(beats, notes["title"])
+
+        if self.cfg.polish:
+            console.print("  each chapter is polished as soon as it is written")
         with ThreadPoolExecutor(jobs) as pool:
-            hook_fut = (
-                pool.submit(write_hook, all_notes, bible, writer, self.cfg, script_dir / f"hook_{key}_{self.cfg.hook_words}.json")
-                if self.cfg.hook
-                else None
-            )
+            hook_fut = pool.submit(hook_job) if self.cfg.hook else None
             beat_futs = [
-                pool.submit(
-                    write_chapter, notes, position, story_before(all_notes, i), previous_context(all_notes, i),
-                    words, bible, writer, self.cfg,
-                    script_dir / f"{notes['cid']}_{position}_{words}_{self.cfg.lang}_{key}.json",
-                )  # fmt: skip
+                pool.submit(chapter_job, i, notes, words, position)
                 for i, (notes, words, position) in enumerate(zip(all_notes, targets, pos))
             ]
             todo = [f for f in (hook_fut, *beat_futs) if f is not None]
@@ -261,10 +293,10 @@ class Project:
         return hook, chapters_out
 
     # ----------------------------------------------------------------- voice
-    def stage_voice(self, script: dict) -> tuple[list[dict], Path, list[tuple[float, str]]]:
+    def stage_voice(self, script: dict, name: str = "narration.wav") -> tuple[list[dict], Path, list[tuple[float, str]]]:
         tcfg = self.cfg.tts
         voice = Voice(tcfg, self.cfg.lang, self.work / "audio")
-        sections = [("Intro", script.get("hook", []))] + [(c["title"], c["beats"]) for c in script["chapters"]]
+        sections = [(script.get("intro_title") or "Intro", script.get("hook", []))] + [(c["title"], c["beats"]) for c in script["chapters"]]
         all_beats = [b for _, beats in sections for b in beats]
         console.print(f"[bold]voice[/]: {len(all_beats)} beats with {tcfg.engine} ({voice.voice or 'default voice'})")
 
@@ -276,7 +308,17 @@ class Project:
                 console.print(f"  voiced {i}/{n} new")
 
         progress.emit("voice", 0, len(all_beats), "loading voice")
-        paths = voice_all(tcfg, self.cfg.lang, self.work / "audio", [b["text"] for b in all_beats], voiced)
+        new = [0]
+
+        def counted(i: int, n: int) -> None:
+            new[0] = n
+            voiced(i, n)
+
+        paths = voice_all(tcfg, self.cfg.lang, self.work / "audio", [b["text"] for b in all_beats], counted)
+        from . import usage
+
+        usage.record("voice", engine=tcfg.engine, lines=new[0], total_lines=len(all_beats), seconds=round(time.time() - t0, 1),
+                     chars=sum(len(b["text"]) for b in all_beats))  # fmt: skip
         flat = [(b, si) for si, (_, beats) in enumerate(sections) for b in beats]
         clips: list[tuple[Path, dict, int]] = [(p, b, si) for p, (b, si) in zip(paths, flat)]
         console.print(f"  voice ready in {time.time() - t0:.0f}s")
@@ -308,15 +350,16 @@ class Project:
         for start, audio in placements:
             buf[start : start + len(audio)] += audio
         buf = buf[: int(total * sr)]
-        narration = self.work / "narration.wav"
+        narration = self.work / name
         sf.write(str(narration), buf, sr)
         console.print(f"narration: {total / 60:.1f} min")
         return timed, narration, markers
 
     # ---------------------------------------------------------------- render
-    def stage_render(self, timed: list[dict], narration: Path, markers: list[tuple[float, str]], out: Path | None) -> Path:
+    def stage_render(self, timed: list[dict], narration: Path, markers: list[tuple[float, str]], out: Path | None, rcfg=None) -> Path:
         from .render import render_video
 
+        rcfg = rcfg or self.cfg.render
         style = self.cfg.render.style
         if style == "auto":
             style = "motion" if self.source == "manga" else "blurfill"
@@ -341,14 +384,179 @@ class Project:
         # chapter markers: YouTube description text + embedded mp4 chapters
         yt = "\n".join(f"{_fmt_ts(ts)} {name}" for ts, name in markers)
         out.with_suffix(".chapters.txt").write_text(yt + "\n", "utf-8")
-        meta = self.work / "chapters.ffmeta"
+        meta = self.work / f"{out.stem}.ffmeta"
         lines = [";FFMETADATA1", f"title={title}"]
         for i, (ts, name) in enumerate(markers):
             end = markers[i + 1][0] if i + 1 < len(markers) else total
             lines += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={int(ts * 1000)}", f"END={int(end * 1000)}", f"title={name}"]
         meta.write_text("\n".join(lines) + "\n", "utf-8")
 
-        render_video(timed, panel_meta, style, self.cfg.render, narration, meta, out, self.work)
+        render_video(timed, panel_meta, style, rcfg, narration, meta, out, self.work)
         console.print(f"[bold green]done:[/] {out}")
         progress.emit("done", 1, 1, "video ready", output=str(out))
         return out
+
+    # ------------------------------------------------------------ parts / preview
+    def default_output(self) -> Path:
+        name = _slug(self.cfg.title or self.input_dir.name)
+        if self.cfg.chapters and self.chapters and len(self.selected) < len(self.chapters):  # a subset gets its own file
+            name += "_ch" + re.sub(r"[^0-9-]+", "_", self.cfg.chapters.replace(" ", "")).strip("_")
+        return self.input_dir / f"{name}_recap.mp4"
+
+    def produce(self, script: dict, out: Path | None = None, until: str = "render", quick: bool = False) -> list[Path]:
+        """Voice (+ render) the script: one video, several parts (episode_minutes), or a quick 480p preview."""
+        base = out or self.default_output()
+        if until == "render":
+            from .render import prewarm
+
+            try:
+                prewarm(self.cfg.render)  # render workers start up while the narration is voiced
+            except Exception:  # noqa: BLE001 - only an optimisation
+                pass
+        if quick:
+            part = self.preview_script(script)
+            timed, narration, markers = self.stage_voice(part, name="narration_preview.wav")
+            if len(timed) > 1 and timed[-1]["end"] > 75:  # the word estimate ran long: cut at ~60 s of real audio
+                keep = max(1, sum(1 for b in timed if b["start"] < 60))
+                part = self._first_beats(part, keep)
+                timed, narration, markers = self.stage_voice(part, name="narration_preview.wav")  # audio is cached
+            if until == "voice":
+                return []
+            rcfg = replace(self.cfg.render, width=854, height=480, fps=24, quality=30, upscaler="off", chunk_seconds=10.0)
+            return [self.stage_render(timed, narration, markers, base.with_name(f"{base.stem}_preview{base.suffix}"), rcfg)]
+        parts = self.parts(script)
+        if len(parts) > 1:  # one voice batch for every part: the TTS workers load their model once, not per part
+            texts = [b["text"] for p in parts for c in [{"beats": p.get("hook", [])}, *p["chapters"]] for b in c["beats"]]
+            t0 = time.time()
+            console.print(f"[bold]voice[/]: {len(texts)} beats for {len(parts)} parts with {self.cfg.tts.engine}")
+            new = [0]
+
+            def tick(i: int, n: int) -> None:
+                new[0] = n
+                progress.emit("voice", i, n, "voicing")
+
+            voice_all(self.cfg.tts, self.cfg.lang, self.work / "audio", texts, tick)
+            from . import usage
+
+            usage.record("voice", engine=self.cfg.tts.engine, lines=new[0], total_lines=len(texts), seconds=round(time.time() - t0, 1),
+                         chars=sum(len(t) for t in texts))  # fmt: skip
+            console.print(f"  voice ready in {time.time() - t0:.0f}s")
+        outs: list[Path] = []
+        for p in parts:
+            suffix = f"_part{p['part']:02d}" if len(parts) > 1 else ""
+            if len(parts) > 1:
+                console.print(f"[bold]part {p['part']}/{len(parts)}[/]: {p['chapters'][0]['title']} - {p['chapters'][-1]['title']}")
+            timed, narration, markers = self.stage_voice(p, name=f"narration{suffix}.wav")
+            if until == "voice":
+                continue
+            outs.append(self.stage_render(timed, narration, markers, base.with_name(f"{base.stem}{suffix}{base.suffix}")))
+        return outs
+
+    def preview_script(self, script: dict, seconds: float = 60.0) -> dict:
+        """The opening ~minute: the hook plus the first beats, enough to judge look, voice and pacing."""
+        budget = seconds * self.cfg.words_per_minute / 60
+        used = sum(len(b["text"].split()) for b in script.get("hook", []))
+        chapters = []
+        for c in script["chapters"]:
+            beats = []
+            for b in c["beats"]:
+                if used >= budget and (beats or chapters):
+                    break
+                beats.append(b)
+                used += len(b["text"].split())
+            if beats:
+                chapters.append({**c, "beats": beats})
+            if used >= budget:
+                break
+        return {**script, "chapters": chapters}
+
+    @staticmethod
+    def _first_beats(script: dict, n: int) -> dict:
+        hook = script.get("hook", [])[:n]
+        left = n - len(hook)
+        chapters = []
+        for c in script["chapters"]:
+            if left <= 0:
+                break
+            chapters.append({**c, "beats": c["beats"][:left]})
+            left -= len(chapters[-1]["beats"])
+        return {**script, "hook": hook, "chapters": chapters}
+
+    def parts(self, script: dict) -> list[dict]:
+        """Split into parts of about episode_minutes (whole chapters only). Parts 2+ open with 'previously on'."""
+        mins, wpm = self.cfg.episode_minutes, self.cfg.words_per_minute
+        chapters = script["chapters"]
+
+        def minutes(beats: list[dict]) -> float:
+            return sum(len(b["text"].split()) for b in beats) / wpm
+
+        total = minutes(script.get("hook", [])) + sum(minutes(c["beats"]) for c in chapters)
+        if mins <= 0 or len(chapters) < 2 or total <= mins * 1.25:
+            return [script]
+        # balanced split: pick the part count, then put each chapter in the part its midpoint falls into
+        lengths = [minutes(c["beats"]) for c in chapters]
+        body = sum(lengths)
+        k = min(len(chapters), max(2, int(body / mins + 0.5)))
+        groups: list[list[dict]] = [[] for _ in range(k)]
+        acc = 0.0
+        for c, m in zip(chapters, lengths):
+            groups[min(k - 1, int((acc + m / 2) / (body / k)))].append(c)
+            acc += m
+        groups = [g for g in groups if g]
+        writer = None
+        out = []
+        for i, g in enumerate(groups):
+            intro, intro_title = script.get("hook", []), "Intro"
+            if i > 0:
+                intro_title = "Previously"
+                if self.cfg.previously:
+                    writer = writer or make_chain(self.cfg.writer, "writer", need_vision=False)
+                    intro = self._previously([c for gg in groups[:i] for c in gg], i + 1, writer)
+                else:
+                    intro = []
+            out.append({**script, "part": i + 1, "parts": len(groups), "hook": intro, "intro_title": intro_title, "chapters": g})
+        return out
+
+    def _previously(self, before: list[dict], part: int, writer, words: int = 75) -> list[dict]:
+        from . import prompts
+        from .story import _cap_words, _clean_text
+
+        story = []
+        budget = 5000  # words of earlier script shown to the model: recent chapters in full, older ones trimmed
+        for k, c in enumerate(reversed(before)):
+            text = " ".join(b["text"] for b in c["beats"])
+            cap = 600 if k < 3 else 120
+            w = text.split()
+            story.append(f"{c['title']}: {' '.join(w[:cap])}{'…' if len(w) > cap else ''}")
+            budget -= min(len(w), cap)
+            if budget <= 0:
+                break
+        story.reverse()
+        beats_all = [b for c in before for b in c["beats"] if b.get("panels")]
+        strong = [b for b in beats_all if b.get("emphasis") in ("hit", "reveal")] or beats_all
+        step = max(1, len(strong) // 40)
+        cands = {b["panels"][0]: b["text"][:110] for b in strong[::step]}
+        last = before[-1]["beats"][-3:]  # where things stood at the end of the last part
+        cands.update({b["panels"][-1]: b["text"][:110] for b in last if b.get("panels")})
+        key = hashlib.sha1(json.dumps([story, sorted(cands), self.cfg.lang, part, words]).encode()).hexdigest()[:12]
+        path = self.work / "script" / f"previously_{key}.json"
+        if path.exists():
+            return json.loads(path.read_text("utf-8"))["beats"]
+        user = (f"LANGUAGE: {self.cfg.lang}\n\nSTORY SO FAR (script of the previous parts):\n" + "\n\n".join(story)
+                + "\n\nIMAGES (id: what it shows):\n" + "\n".join(f"{pid}: {t}" for pid, t in cands.items()))  # fmt: skip
+        system = prompts.PREVIOUSLY_SYSTEM.replace("{PART}", str(part)).replace("{WORDS}", str(words))
+        try:
+            res = writer.complete_json(system, [user])
+        except Exception as e:  # noqa: BLE001 - a part without a recap is still a fine video
+            console.print(f"[yellow]'previously on' for part {part} failed ({e}); starting without it[/]")
+            return []
+        beats = []
+        for b in res.get("beats", []) if isinstance(res, dict) else []:
+            text = _clean_text(str(b.get("text") or ""))
+            pids = [p for p in b.get("panels") or [] if p in cands][:2] or list(cands)[-1:]
+            if text and pids:
+                beats.append({"text": text, "panels": pids, "emphasis": b.get("emphasis") or "normal"})
+        beats = _cap_words(beats, int(words * 1.3))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"beats": beats}, ensure_ascii=False, indent=1), "utf-8")
+        return beats
