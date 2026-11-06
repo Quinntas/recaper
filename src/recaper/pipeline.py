@@ -337,8 +337,13 @@ class Project:
         t = 0.3
         timed: list[dict] = []
         markers: list[tuple[float, str]] = []
-        placements: list[tuple[int, np.ndarray]] = []
+        placements: list[tuple[int, Path]] = []
         last_section = -1
+
+        def clip_frames(path: Path) -> int:  # what load_audio will return, without loading it
+            info = sf.info(str(path))
+            return info.frames if info.samplerate == sr else int(round(info.frames * sr / info.samplerate))
+
         for path, beat, si in clips:
             if si != last_section:
                 if last_section != -1:
@@ -346,22 +351,36 @@ class Project:
                 if sections[si][1]:
                     markers.append((0.0 if not markers else t, sections[si][0]))
                 last_section = si
-            audio = load_audio(path, sr)
-            placements.append((int(t * sr), audio))
+            placements.append((int(t * sr), path))
             timed.append({"start": t, "end": 0.0, "panels": beat["panels"], "emphasis": beat.get("emphasis", "normal")})
-            t += len(audio) / sr + tcfg.beat_gap
+            t += clip_frames(path) / sr + tcfg.beat_gap
         total = t + 0.8
         for i, b in enumerate(timed):
             b["end"] = timed[i + 1]["start"] if i + 1 < len(timed) else total
         if timed:
             timed[0]["start"] = 0.0
 
-        buf = np.zeros(int(total * sr) + sr, np.float32)
-        for start, audio in placements:
-            buf[start : start + len(audio)] += audio
-        buf = buf[: int(total * sr)]
+        # streamed to disk clip by clip: a whole book is ~20 h of audio (6+ GB as one array);
+        # RF64 past ~4 GB, where a plain WAV header overflows
+        total_n = int(total * sr)
         narration = self.work / name
-        sf.write(str(narration), buf, sr)
+        fmt = "RF64" if total_n * 2 > 3_900_000_000 else "WAV"
+        with sf.SoundFile(str(narration), "w", sr, 1, subtype="PCM_16", format=fmt) as wav:
+            pos = 0
+
+            def silence(n: int) -> None:
+                nonlocal pos
+                while n > 0:
+                    k = min(n, sr * 10)
+                    wav.write(np.zeros(k, np.float32))
+                    pos, n = pos + k, n - k
+
+            for start, path in placements:
+                silence(start - pos)
+                audio = load_audio(path, sr)[max(0, pos - start) : max(0, total_n - start)]
+                wav.write(audio)
+                pos += len(audio)
+            silence(total_n - pos)
         words = sum(len(b["text"].split()) for b in all_beats)
         if words >= 300:  # the real pace (voice + pauses) makes later length estimates honest
             from . import usage

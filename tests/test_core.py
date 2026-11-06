@@ -1070,3 +1070,35 @@ def test_human_style_known_audience_and_intro_toggle(samples, tmp_path):
     later.stage_panels()
     later._selection_key()
     assert later.cfg.known_story == "yes"
+
+
+def test_long_narration_masters_in_parallel_pieces(tmp_path, monkeypatch):
+    """Book-length narration: split at pauses, filtered in parallel, encoded once; same length, cached."""
+    import subprocess
+
+    import soundfile as sf
+
+    from recaper.render import encode
+
+    sr = 24000
+    rng = np.random.default_rng(1)
+    parts = []
+    for _ in range(40):  # 40 "beats" of noise speech with 0.25 s pauses
+        parts += [0.2 * rng.standard_normal(int(sr * 1.2)).astype(np.float32), np.zeros(int(sr * 0.25), np.float32)]
+    nar = tmp_path / "narration.wav"
+    sf.write(str(nar), np.concatenate(parts), sr)
+    monkeypatch.setattr(encode, "SEGMENT_SECONDS", 15.0)
+    cuts = encode.quiet_cuts(nar)
+    audio = sf.read(str(nar), dtype="float32")[0]
+    assert len(cuts) >= 2 and all(abs(audio[c]) == 0 for c in cuts)  # every cut lands in a pause
+
+    out = tmp_path / "render"
+    out.mkdir()
+    m = encode.master_audio(nar, -16.0, out, workers=2)
+    probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(m)], capture_output=True, text=True)
+    assert abs(float(probe.stdout) - len(audio) / sr) < 0.05
+    assert not list(out.glob("narration_piece_*"))  # temp pieces cleaned up
+    stamp = m.stat().st_mtime_ns
+    assert encode.master_audio(nar, -16.0, out) == m and m.stat().st_mtime_ns == stamp  # cached
+    encode.master_audio(nar, -14.0, out)
+    assert m.stat().st_mtime_ns != stamp  # loudness change re-masters
