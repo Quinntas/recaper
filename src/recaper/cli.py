@@ -14,7 +14,7 @@ from .log import console
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Turn a folder of manga / manhwa chapters into a narrated recap video.")
 load_env()  # GEMINI_API_KEY / OPENAI_API_KEY etc. from .env (never printed)
 
-STAGES = ["panels", "read", "script", "voice", "render"]
+STAGES = ["panels", "read", "script", "images", "voice", "render"]
 
 
 @app.command()
@@ -42,8 +42,8 @@ def run(
     jobs: Optional[int] = typer.Option(None, "--jobs", "-j", help="Parallel model calls for reading/writing (default 6)"),
     read_batch: Optional[int] = typer.Option(None, "--read-batch", help="Max panels per reader call (default 36; recommend 8-12 for Ollama)"),
     out: Optional[Path] = typer.Option(None, "--out", "-o", help="Output .mp4 path"),
-    until: str = typer.Option("render", help="Stop after stage: panels | read | script | voice | render"),
-    force: list[str] = typer.Option([], "--force", "-f", help="Redo a stage (repeatable): panels | read | script | voice | render"),
+    until: str = typer.Option("render", help="Stop after stage: panels | read | script | images | voice | render"),
+    force: list[str] = typer.Option([], "--force", "-f", help="Redo a stage (repeatable): panels | read | script | images | voice | render"),
     preview: bool = typer.Option(False, help="Write panel contact sheets to .recaper/preview/ (check the slicing)"),
     quick: bool = typer.Option(False, "--quick", help="Quick preview: only the first ~60 s, rendered at 480p (<name>_preview.mp4)"),
     parts: Optional[float] = typer.Option(None, "--parts", help="Split into parts of about N minutes, each with a 'previously on' intro (0 = one video)"),
@@ -93,7 +93,9 @@ def run(
         project.stage_panels(preview=preview)
         if until != "panels":
             script = project.stage_script(until_read=(until == "read"))
-            if until not in ("read", "script") and script:
+            if until not in ("read", "script") and script and not quick:  # quick previews use the pictures made so far
+                script = project.stage_images(script)
+            if until not in ("read", "script", "images") and script:
                 outputs = project.produce(script, out, until=until, quick=quick)
                 if until == "voice":
                     console.print(f"narration written to {project.work}")

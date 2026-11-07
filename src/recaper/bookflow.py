@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import threading
+import re
 import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
@@ -24,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 import cv2
 import numpy as np
 
-from . import imagegen, progress, prompts
+from . import imagegen, progress, prompts, webrefs
 from .books import BookChapter, extract
 from .config import Config, parse_chapter_ranges
 from .ingest import Chapter
@@ -240,9 +241,15 @@ def _load_source_notes(src: Path) -> list[dict]:
     return [json.loads(p.read_text("utf-8")) for p in have]
 
 
-def related_library(project: "Project", all_notes: list[dict], writer: Chain) -> dict[str, list[dict]]:
-    """book cid -> candidate images from linked adaptations: [{label, src, pid, desc, chars, weight}]."""
-    sources = _source_projects(project)
+def _volume(n: dict) -> str:
+    m = re.search(r"vol(?:ume)?[\s\-_.]*(\d+)", str(n.get("volume") or ""), re.I)
+    return f" [LN volume {m.group(1)}]" if m else ""
+
+
+def related_library(project: "Project", all_notes: list[dict], writer: Chain, extra: list[Path] | None = None) -> dict[str, list[dict]]:
+    """book cid -> candidate images from linked adaptations and online references:
+    [{label, src, pid, desc, chars, weight, kind}]."""
+    sources = _source_projects(project) + list(extra or [])
     if not sources:
         return {}
     src_notes: dict[str, dict] = {}  # key "<src>:<cid>" -> notes
@@ -261,7 +268,7 @@ def related_library(project: "Project", all_notes: list[dict], writer: Chain) ->
         mapping = {}
         for i in range(0, len(all_notes), 30):
             chunk = all_notes[i : i + 30]
-            book_lines = "\n".join(f"{n['cid']}: {n['title']} - {' '.join(n['summary'].split()[:60])}" for n in chunk)
+            book_lines = "\n".join(f"{n['cid']}{_volume(n)}: {n['title']} - {' '.join(n['summary'].split()[:60])}" for n in chunk)
             console.print(f"  matching book chapters {i + 1}-{i + len(chunk)} to {len(src_notes)} adaptation chapters")
             res = writer.complete_json(prompts.MAP_SYSTEM, [f"BOOK CHAPTERS:\n{book_lines}\n\nADAPTATION CHAPTERS:\n{src_lines}"])
             for cid, keys in (res.get("map") or {}).items():
@@ -276,11 +283,18 @@ def related_library(project: "Project", all_notes: list[dict], writer: Chain) ->
             sn = src_notes[k]
             for lab, info in sn["panels"].items():
                 if info.get("story", True) and info.get("weight", 2) >= 2 and info.get("desc"):
-                    cands.append({"src": sn["_src"], "pid": sn["labels"][lab], "desc": info["desc"], "chars": info.get("chars") or [], "weight": info["weight"]})
+                    cands.append({"src": sn["_src"], "pid": sn["labels"][lab], "desc": info["desc"], "chars": info.get("chars") or [],
+                                  "weight": info["weight"], "kind": "anime still" if sn.get("kind") == "anime" else "adaptation panel"})  # fmt: skip
         cands.sort(key=lambda c: -c["weight"])
-        for j, c in enumerate(cands[:cap], start=1):
+        # R* = linked adaptation panels, A* = anime stills: separate numbering, so adding online references never
+        # renames the labels of chapters that are already written
+        linked = [c for c in cands if c["kind"] != "anime still"][:cap]
+        stills = [c for c in cands if c["kind"] == "anime still"][:cap]
+        for j, c in enumerate(linked, start=1):
             c["label"] = f"R{j}"
-        out[n["cid"]] = cands[:cap]
+        for j, c in enumerate(stills, start=1):
+            c["label"] = f"A{j}"
+        out[n["cid"]] = linked + stills
     linked = sum(1 for v in out.values() if v)
     console.print(f"  related works: {linked}/{len(all_notes)} chapters have matching adaptation panels")
     return out
@@ -334,7 +348,7 @@ def library_text(notes: dict, related: list[dict]) -> str:
         if info.get("story", True):
             lines.append(f"{lab} (book illustration): {info['desc']}")
     for c in related:
-        lines.append(f"{c['label']} (adaptation panel): {c['desc']}")
+        lines.append(f"{c['label']} ({c.get('kind', 'adaptation panel')}): {c['desc']}")
     return "\n".join(lines) or "(no images - use \"generate\" for the key moments)"
 
 
@@ -392,18 +406,58 @@ def resolve_pictures(notes: dict, related: list[dict], raw: list[dict], xref: Xr
     return out
 
 
+def repick_pictures(notes: dict, related: list[dict], raw: list[dict], writer: Chain, cache_dir: Path) -> list[dict]:
+    """Picture pass for an already-written chapter: beats without a real picture (they asked for a generated
+    one) get a fitting image from the library - now with the online references - without rewriting the text."""
+    needs = [i for i, b in enumerate(raw) if not b["refs"]]
+    pool = [c for c in related if c.get("kind") == "anime still"]
+    if not needs or not pool:
+        return raw
+    library = library_text(notes, related)
+    key = hashlib.sha1(json.dumps([[b["text"] for b in raw], needs, [c["pid"] for c in related]]).encode()).hexdigest()[:12]
+    path = cache_dir / f"{notes['cid']}_pics_{key}.json"
+    if path.exists():
+        picks = json.loads(path.read_text("utf-8"))
+    else:
+        lines = [f"{i + 1}.{' [needs picture]' if i in needs else ' (has: ' + ','.join(b['refs']) + ')'} {b['text']}" for i, b in enumerate(raw)]
+        try:
+            res = writer.complete_json(prompts.PICTURE_SYSTEM, [f"CHAPTER: {notes['title']}\n\nBEATS:\n" + "\n".join(lines) +
+                                                                f"\n\nIMAGE LIBRARY (label: what it shows):\n{library}"])  # fmt: skip
+        except Exception as e:  # noqa: BLE001 - the beats keep their generate request
+            console.print(f"[yellow]{notes['cid']}: picture pass failed ({e})[/]")
+            return raw
+        valid = set(notes["labels"]) | {c["label"] for c in related}
+        picks = {}
+        for k, labs in (res.get("picks") or {}).items():
+            m = re.search(r"\d+", str(k))
+            if m and isinstance(labs, list):
+                picks[str(int(m.group()) - 1)] = [x for x in (str(v).strip().upper() for v in labs) if x in valid][:2]
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(picks), "utf-8")
+    out = []
+    for i, b in enumerate(raw):
+        labs = picks.get(str(i)) if i in needs else None
+        out.append(b | {"refs": labs} if labs else b)
+    return out
+
+
 # --------------------------------------------------------------- pictures
 
 
 class Gallery:
     """Generated images (panels/gen/) + fallback title cards (panels/card/)."""
 
-    def __init__(self, work: Path, cfg: Config):
+    def __init__(self, work: Path, cfg: Config, checker: Chain | None = None):
         self.work, self.cfg = work, cfg
         self.dir = work / "panels" / "gen"
         self.index = self.dir / "panels.json"
         self.items = json.loads(self.index.read_text("utf-8")) if self.index.exists() else []
         self.by_key = {it["key"]: it for it in self.items}
+        self.rejected_file = self.dir / "rejected.json"
+        self.rejected: dict = json.loads(self.rejected_file.read_text("utf-8")) if self.rejected_file.exists() else {}
+        self.checker = checker if cfg.images.quality_check else None
+        self.qc_stats = {"passed": 0, "redone": 0, "dropped": 0}
+        self.counts = {"cached": 0, "attempts": 0, "first_tries": 0}
         self.budget = cfg.images.max_generated
         ok, why = imagegen.available(cfg.images.generator)
         self.enabled, self.why = ok, why
@@ -414,41 +468,89 @@ class Gallery:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.index.write_text(json.dumps(self.items, ensure_ascii=False, indent=1), "utf-8")
 
-    def generate(self, prompt: str, refs: list[Path], cached_only: bool = False) -> str | None:
+    def check(self, image: Path, prompt: str, refs: list[Path], ref_notes: list[str]) -> dict:
+        """Vision QC: {"score": 1-10, "problems": [...]}; a failed check passes the image (never blocks)."""
+        parts: list = [f"SCENE THE IMAGE MUST SHOW:\n{prompt}\n\nREFERENCE IMAGES:"]
+        for i, r in enumerate(refs):
+            parts += [f"[reference {i + 1}: {ref_notes[i] if i < len(ref_notes) else 'official art'}]", ImagePart(r)]
+        parts += ["[GENERATED IMAGE - judge this one]", ImagePart(image)]
+        try:
+            res = self.checker.complete_json(prompts.QC_SYSTEM, parts)
+            score = float(res.get("score", 0) or 0)
+            return {"score": score, "problems": [str(p) for p in (res.get("problems") or [])][:6]}
+        except Exception as e:  # noqa: BLE001
+            return {"score": 10.0, "problems": [], "error": str(e)[:160]}
+
+    def generate(self, prompt: str, refs: list[Path], cached_only: bool = False, ref_notes: list[str] | None = None,
+                 fresh: bool = False) -> str | None:
+        """Generated panel id for this prompt + references (cached), or None (the caller keeps a real picture).
+        fresh: draw it again even if cached or rejected before (the old picture is replaced on success)."""
         spec = self.cfg.images.generator
         full = f"{self.cfg.images.style}. {prompt}"
         key = imagegen.cache_key(spec, full, refs)
         with self._lock:  # reserve a slot: id + budget
-            if key in self.by_key and (self.work / self.by_key[key]["file"]).exists():
+            if not fresh and key in self.by_key and (self.work / self.by_key[key]["file"]).exists():
+                self.counts["cached"] += 1
                 return self.by_key[key]["id"]
-            if cached_only:
+            if (key in self.rejected and not fresh) or cached_only:  # failed the quality check twice before: use a real picture
                 return None
             if not self.enabled:
                 imagegen.warn_once(f"image generation unavailable: {self.why} - using the nearest real image instead")
                 return None
-            if self.budget <= 0:
+            if self.budget <= 0 and not fresh:
                 imagegen.warn_once(f"generated-image budget ({self.cfg.images.max_generated}) used up - reusing real images")
                 return None
             n, self._next = self._next, self._next + 1
             self.budget -= 1
         rel = Path("panels") / "gen" / f"p{n:04d}.png"
-        try:
-            imagegen.generate(spec, full, refs, self.work / rel)
-        except imagegen.ImageGenError as e:
-            msg = str(e).lower()
+        ask, qc, tries = full, None, (2 if self.checker else 1)
+        for attempt in range(tries):
+            try:
+                with self._lock:
+                    self.counts["attempts"] += 1
+                    self.counts["first_tries"] += attempt == 0
+                imagegen.generate(spec, ask, refs, self.work / rel, ref_notes=ref_notes, quality=self.cfg.images.quality,
+                                  price_override=self.cfg.images.price)
+            except imagegen.ImageGenError as e:
+                msg = str(e).lower()
+                with self._lock:
+                    self.budget += 1
+                    if any(k in msg for k in ("credit", "quota", "billing", "402", "429", "exhausted", "api key", "permission", "not installed", "sign in")):
+                        self.enabled, self.why = False, f"{spec} unavailable ({str(e)[:160]})"  # stop trying for this run
+                imagegen.warn_once(f"image generation failed: {str(e)[:200]}")
+                return None
+            img = _trim_letterbox(imread(self.work / rel))
+            imwrite(self.work / rel.with_suffix(".jpg"), img, quality=93)
+            (self.work / rel).unlink(missing_ok=True)
+            if not self.checker:
+                break
+            qc = self.check(self.work / rel.with_suffix(".jpg"), prompt, refs, ref_notes or [])
+            if qc["score"] >= self.cfg.images.min_score:
+                with self._lock:
+                    self.qc_stats["passed"] += 1
+                break
+            console.print(f"  [dim]image {n} scored {qc['score']:.0f}/10: {'; '.join(qc['problems'])[:160]}[/]")
+            if attempt + 1 < tries:  # redo once, telling the generator what went wrong
+                with self._lock:
+                    self.qc_stats["redone"] += 1
+                ask = f"{full}\n\nA previous attempt was rejected for: {'; '.join(qc['problems']) or 'poor quality'}. Avoid these problems."
+        else:
+            (self.work / rel.with_suffix(".jpg")).unlink(missing_ok=True)
             with self._lock:
-                self.budget += 1
-                if any(k in msg for k in ("credit", "quota", "billing", "402", "429", "exhausted", "api key", "permission", "not installed", "sign in")):
-                    self.enabled, self.why = False, f"{spec} unavailable ({str(e)[:160]})"  # stop trying for this run
-            imagegen.warn_once(f"image generation failed: {str(e)[:200]}")
+                self.qc_stats["dropped"] += 1
+                self.rejected[key] = {"prompt": prompt, "qc": qc}
+                self.dir.mkdir(parents=True, exist_ok=True)
+                self.rejected_file.write_text(json.dumps(self.rejected, ensure_ascii=False, indent=1), "utf-8")
             return None
-        img = _trim_letterbox(imread(self.work / rel))
-        imwrite(self.work / rel.with_suffix(".jpg"), img, quality=93)
-        (self.work / rel).unlink(missing_ok=True)
         rel = rel.with_suffix(".jpg")
         item = {"id": f"gen-p{n:04d}", "chapter": "gen", "file": rel.as_posix(), "w": int(img.shape[1]), "h": int(img.shape[0]),
-                "page": None, "key": key, "prompt": prompt, "refs": [str(r) for r in refs]}  # fmt: skip
+                "page": None, "key": key, "prompt": prompt, "refs": [str(r) for r in refs], **({"qc": qc} if qc else {})}  # fmt: skip
         with self._lock:
+            for old in [it for it in self.items if it["key"] == key]:  # a redraw replaces the previous picture
+                self.items.remove(old)
+                (self.work / old["file"]).unlink(missing_ok=True)
+            if self.rejected.pop(key, None) is not None:
+                self.rejected_file.write_text(json.dumps(self.rejected, ensure_ascii=False, indent=1), "utf-8")
             self.items.append(item)
             self.by_key[key] = item
             self._save()
@@ -498,11 +600,23 @@ class Gallery:
 def _trim_letterbox(img: np.ndarray, tol: float = 10.0) -> np.ndarray:
     """Remove uniform black/white bars some image models add around a 16:9 picture."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    rows = np.flatnonzero((gray.std(axis=1) > tol) | (np.abs(gray.mean(axis=1) - gray[gray.shape[0] // 2].mean()) < 60))
-    cols = np.flatnonzero((gray.std(axis=0) > tol) | (np.abs(gray.mean(axis=0) - gray[:, gray.shape[1] // 2].mean()) < 60))
-    if rows.size < gray.shape[0] * 0.5 or cols.size < gray.shape[1] * 0.5:
+
+    def bar(lines: np.ndarray) -> np.ndarray:  # flat and near black or near white
+        mean = lines.mean(axis=1)
+        return (lines.std(axis=1) < tol) & ((mean < 32) | (mean > 223))
+
+    def span(is_bar: np.ndarray) -> tuple[int, int]:
+        a, b = 0, len(is_bar)
+        while a < b and is_bar[a]:
+            a += 1
+        while b > a and is_bar[b - 1]:
+            b -= 1
+        return a, b
+
+    (r0, r1), (c0, c1) = span(bar(gray)), span(bar(gray.T))
+    if r1 - r0 < gray.shape[0] * 0.5 or c1 - c0 < gray.shape[1] * 0.5:
         return img
-    return img[rows[0] : rows[-1] + 1, cols[0] : cols[-1] + 1]
+    return img[r0:r1, c0:c1]
 
 
 def _panel_path(work: Path, pid: str) -> Path | None:
@@ -514,78 +628,26 @@ def _panel_path(work: Path, pid: str) -> Path | None:
     return work / item["file"] if item else None
 
 
-def fill_pictures(chapters_out: list[dict], all_notes: list[dict], bible: Bible, project: "Project") -> dict:
-    """Give every beat a picture.
+def _colourful(path: Path, _memo: dict = {}) -> bool:  # noqa: B006 - per-process memo
+    """Colour art (vs the black-and-white interior illustrations): only colour makes a good style reference."""
+    if path not in _memo:
+        img = cv2.imread(str(path), cv2.IMREAD_REDUCED_COLOR_4)
+        _memo[path] = img is not None and float(cv2.cvtColor(img, cv2.COLOR_BGR2HSV)[..., 1].mean()) > 35
+    return _memo[path]
 
-    1. beats that asked for one get a generated image (with official-art references); the generation budget
-       is spread over chapters in proportion to how many pictures each asked for
-    2. other empty beats take a picture from their chapter's pool (its illustrations, adaptation panels and
-       pictures used elsewhere in it) - the one used closest in the story, avoiding back-to-back repeats
-    3. a chapter with no pictures at all carries the previous chapter's last one; a title card is the last resort
-    """
+
+def fill_real_pictures(chapters_out: list[dict], all_notes: list[dict], project: "Project") -> dict:
+    """Script stage: give every beat a real picture.
+
+    Empty beats take a picture from their chapter's pool (its illustrations, adaptation panels / anime stills and
+    pictures used elsewhere in it) - the one used closest in the story, avoiding back-to-back repeats. A chapter
+    with no pictures at all carries the previous chapter's last one; a title card is the last resort.
+    Beats that asked for a generated picture keep their "generate" request: the images stage (generate_pictures)
+    swaps their picture for a generated one, and this real one stays as its fallback."""
     work, cfg = project.work, project.cfg
     gallery = Gallery(work, cfg)
     notes_by = {n["cid"]: n for n in all_notes}
-    chars_of: dict[str, set[str]] = {}
-    for n in all_notes:
-        for lab, info in n["panels"].items():
-            chars_of[n["labels"][lab]] = {c.lower() for c in info.get("chars") or []}
-    ref_pool: list[tuple[Path, set[str]]] = []
-    seen: set[str] = set()
-    for ch in chapters_out:
-        for b in ch["beats"]:
-            for pid in b["panels"]:
-                if pid not in seen and (p := _panel_path(work, pid)):
-                    seen.add(pid)
-                    ref_pool.append((p, chars_of.get(pid, set()) | {c.lower() for c in b.get("chars") or []}))
-    for n in all_notes:  # unused book illustrations are great style references too
-        for lab, info in n["panels"].items():
-            pid = n["labels"][lab]
-            if pid not in seen and info.get("story", True) and (p := _panel_path(work, pid)):
-                seen.add(pid)
-                ref_pool.append((p, {c.lower() for c in info.get("chars") or []}))
-
-    # 1. generation, budget spread across chapters
-    asked = [sum(1 for b in ch["beats"] if not b["panels"] and b.get("generate")) for ch in chapters_out]
-    total_asked = sum(asked)
-    quota = [0] * len(chapters_out)
-    if total_asked and gallery.enabled:
-        budget = min(gallery.budget, total_asked)
-        quota = [min(a, int(budget * a / total_asked)) for a in asked]
-        for i in sorted(range(len(asked)), key=lambda i: -asked[i]):  # hand out the rounding remainder
-            if sum(quota) >= budget:
-                break
-            if quota[i] < asked[i]:
-                quota[i] += 1
-    stats = {"generated": 0, "reused": 0, "cards": 0}
-    tasks = []
-    for ci, ch in enumerate(chapters_out):
-        want = [b for b in ch["beats"] if not b["panels"] and b.get("generate")]
-        if not want:
-            continue
-        # spread this chapter's quota evenly over its requests (not just the first ones)
-        step = len(want) / quota[ci] if quota[ci] else 0
-        picks = {int(k * step) for k in range(quota[ci])} if quota[ci] else set()
-        for k, b in enumerate(want):
-            who = {c.lower() for c in b.get("chars") or []}
-            refs = sorted(ref_pool, key=lambda pc: -len(pc[1] & who))[: max(0, cfg.images.refs)]
-            looks = "; ".join(f"{c}: {bible.characters[c]['desc']}" for c in b.get("chars") or [] if c in bible.characters)
-            prompt = f"Scene: {b['generate']}" + (f" Characters - {looks}" if looks else "")
-            tasks.append((b, prompt, [p for p, _ in refs], k not in picks))
-
-    def make(task):
-        b, prompt, refs, cached_only = task
-        return b, gallery.generate(prompt, refs, cached_only=cached_only)
-
-    # image APIs and the Antigravity agent are slow per image (10-70 s) but take parallel requests
-    with ThreadPoolExecutor(max(1, min(4, cfg.jobs))) as pool:
-        for done, (b, pid) in enumerate(pool.map(make, tasks), start=1):
-            progress.emit("script", None, None, f"pictures {done}/{total_asked}")
-            if pid:
-                b["panels"] = [pid]
-                stats["generated"] += 1
-
-    # 2./3. fill the rest from the chapter's own pool
+    stats = {"reused": 0, "cards": 0, "wanted": sum(1 for c in chapters_out for b in c["beats"] if b.get("generate"))}
     carry: str | None = None
     for ch in chapters_out:
         beats = ch["beats"]
@@ -624,7 +686,184 @@ def fill_pictures(chapters_out: list[dict], all_notes: list[dict], bible: Bible,
             prev = pid
         last = next((b["panels"][-1] for b in reversed(beats) if b["panels"]), None)
         carry = last or carry
+    return stats
+
+
+class _References:
+    """Picks the reference images for one generation: the official design of every character in the scene
+    (online references), then colour frames of the same arc (anime stills of the episodes matched to the chapter)
+    for the art style; the book's colour illustrations when nothing else exists."""
+
+    def __init__(self, work: Path, cfg: Config, bible: Bible, all_notes: list[dict], chapters: list[dict], arc_stills: dict[str, list[str]]):
+        self.cfg, self.bible, self.arc_stills = cfg, bible, arc_stills
+        chars_of: dict[str, set[str]] = {}
+        for n in all_notes:
+            for lab, info in n["panels"].items():
+                chars_of[n["labels"][lab]] = {c.lower() for c in info.get("chars") or []}
+        pool: list[tuple[Path, set[str]]] = []
+        seen: set[str] = set()
+        for ch in chapters:
+            for b in ch["beats"]:
+                for pid in b.get("fallback") or b["panels"]:
+                    if pid not in seen and not pid.startswith(("gen-", "card-")) and (p := _panel_path(work, pid)):
+                        seen.add(pid)
+                        pool.append((p, chars_of.get(pid, set()) | {c.lower() for c in b.get("chars") or []}))
+        for n in all_notes:  # unused book illustrations are style references too
+            for lab, info in n["panels"].items():
+                pid = n["labels"][lab]
+                if pid not in seen and info.get("story", True) and (p := _panel_path(work, pid)):
+                    seen.add(pid)
+                    pool.append((p, {c.lower() for c in info.get("chars") or []}))
+        self.colour_pool = [rp for rp in pool if _colourful(rp[0])] or pool
+        self.designs = webrefs.character_refs(work)
+        self.alias = {a.lower(): name.lower() for name, info in bible.characters.items() for a in [name, *(info.get("aliases") or [])]}
+        self.frames = webrefs.stills(work)
+
+    def design(self, name: str) -> Path | None:
+        return self.designs.get(self.alias.get(name.lower(), name.lower()))
+
+    def cast(self, b: dict) -> list[str]:
+        """The beat's characters + bible names its scene description mentions."""
+        names = list(dict.fromkeys(b.get("chars") or []))
+        text = b.get("generate") or ""
+        for a, name in self.alias.items():
+            if len(a) > 2 and re.search(rf"\b{re.escape(a)}\b", text, re.I):
+                full = next((n for n in self.bible.characters if n.lower() == name), name)
+                if full not in names and not any(self.alias.get(x.lower()) == name for x in names):
+                    names.append(full)
+        return names[:4]
+
+    def pick(self, cid: str, b: dict) -> tuple[list[Path], list[str], list[str]]:
+        """(reference images, what each one is, characters without a design)."""
+        who = self.cast(b)
+        who_l = {self.alias.get(c.lower(), c.lower()) for c in who} | {c.lower() for c in who}
+        refs: list[Path] = []
+        notes: list[str] = []
+        cap = max(0, self.cfg.images.refs)
+        for c in who:
+            d = self.design(c)
+            if d and d not in refs and len(refs) < max(1, cap - 1):
+                refs.append(d)
+                notes.append(f"{c}'s official character design (draw {c} exactly like this, at the age the scene says)")
+        arc = [self.frames[pid] for pid in self.arc_stills.get(cid, []) if pid in self.frames]
+        if arc or self.frames:
+            style = sorted(arc or list(self.frames.values()), key=lambda pc: -len(pc[1] & who_l))
+            note = "a frame from the anime adaptation - match its art style, colouring and how these characters look at this point of the story"
+        else:
+            style = sorted(self.colour_pool, key=lambda pc: -len(pc[1] & who_l))
+            note = "official art of this work - match its art style"
+        for p, _ in style:
+            if len(refs) >= cap:
+                break
+            if p not in refs:
+                refs.append(p)
+                notes.append(note)
+        missing = [c for c in who if not self.design(c) and c in self.bible.characters]
+        return refs, notes, missing
+
+    def prompt(self, b: dict, missing: list[str]) -> str:
+        # narrative bible notes ("formerly a 34-year-old shut-in") mislead image models: only for characters without a design
+        looks = "; ".join(f"{c}: {self.bible.characters[c]['desc'][:200]}" for c in missing)
+        return f"Scene: {b['generate']}" + (f" Characters - {looks}" if looks else "")
+
+
+def _real_fallback(beats: list[dict], i: int) -> list[str]:
+    """A real picture for beat i when the script has none recorded (scripts made before the images stage)."""
+    for d in range(1, len(beats)):
+        for j in (i - d, i + d):
+            if 0 <= j < len(beats):
+                real = [p for p in (beats[j].get("fallback") or beats[j]["panels"]) if not p.startswith("gen-")]
+                if real:
+                    return real[:1]
+    return []
+
+
+def generate_pictures(project: "Project", script: dict, checker: Chain | None = None) -> dict:
+    """Images stage (books): beats that asked for a generated picture get one, in place of their real fallback.
+
+    The generation budget (images.max_generated) is spread over chapters in proportion to how many pictures each
+    asked for, and over each chapter's requests evenly. Results are cached by prompt + references, so re-running
+    only makes what is missing (removed or never made). With quality_check on, the reader scores each result:
+    bad ones are redone once with the problems listed, then dropped (the beat keeps its real picture)."""
+    work, cfg = project.work, project.cfg
+    chapters = script.get("chapters") or []
+    bible = Bible()
+    if (work / "bible.json").exists():
+        data = json.loads((work / "bible.json").read_text("utf-8"))
+        bible.characters, bible.terms = data.get("characters", {}), data.get("terms", {})
+    all_notes = [json.loads(f.read_text("utf-8")) for c in chapters if (f := work / "notes" / f"{c['cid']}.json").exists()]
+    ctx_file = work / "pictures_ctx.json"
+    arc_stills = json.loads(ctx_file.read_text("utf-8")).get("arc_stills", {}) if ctx_file.exists() else {}
+    gallery = Gallery(work, cfg, checker)
+
+    # every request starts from its real picture, so generated ones can be swapped in and out
+    want_by_ch: list[list[dict]] = []
+    for ch in chapters:
+        want = []
+        for i, b in enumerate(ch["beats"]):
+            if not b.get("generate"):
+                continue
+            if "fallback" not in b:
+                b["fallback"] = [p for p in b["panels"] if not p.startswith("gen-")] or _real_fallback(ch["beats"], i)
+            want.append(b)
+        want_by_ch.append(want)
+    asked = [len(w) for w in want_by_ch]
+    total_asked = sum(asked)
+    quota = [0] * len(chapters)
+    if total_asked and gallery.enabled:
+        budget = min(gallery.budget, total_asked)
+        quota = [min(a, int(budget * a / total_asked)) for a in asked]
+        for i in sorted(range(len(asked)), key=lambda i: -asked[i]):  # hand out the rounding remainder
+            if sum(quota) >= budget:
+                break
+            if quota[i] < asked[i]:
+                quota[i] += 1
+    picker = _References(work, cfg, bible, all_notes, chapters, arc_stills)
+    tasks = []
+    for ci, (ch, want) in enumerate(zip(chapters, want_by_ch)):
+        step = len(want) / quota[ci] if quota[ci] else 0  # spread the quota over the chapter, not just its first requests
+        picks = {int(k * step) for k in range(quota[ci])} if quota[ci] else set()
+        for k, b in enumerate(want):
+            refs, ref_notes, missing = picker.pick(ch["cid"], b)
+            fresh = bool(b.pop("regen", False))  # asked from the Generated tab: draw it again, outside the quota
+            tasks.append((b, picker.prompt(b, missing), refs, ref_notes, k not in picks and not fresh, fresh))
+
+    def make(task):
+        b, prompt, refs, ref_notes, cached_only, fresh = task
+        return b, gallery.generate(prompt, refs, cached_only=cached_only, ref_notes=ref_notes, fresh=fresh)
+
+    stats = {"asked": total_asked, "generated": 0, "fallback": 0}
+    console.print(f"[bold]images[/]: {total_asked} beat(s) want a generated picture, budget {cfg.images.max_generated} "
+                  f"({cfg.images.generator}{', quality check on' if gallery.checker else ''})")  # fmt: skip
+    progress.emit("images", 0, max(1, len(tasks)), "generating pictures")
+    # image APIs and the Antigravity agent are slow per image (10-70 s) but take parallel requests
+    with ThreadPoolExecutor(max(1, min(4, cfg.jobs))) as pool:
+        for done, (b, pid) in enumerate(pool.map(make, tasks), start=1):
+            progress.emit("images", done, len(tasks), f"pictures {done}/{len(tasks)}")
+            if pid:
+                b["panels"] = [pid]
+                stats["generated"] += 1
+            else:
+                b["panels"] = list(b["fallback"]) or b["panels"]
+                stats["fallback"] += 1
+    live = {it["id"] for it in gallery.items}
+    for ch in chapters:  # pictures removed (redrawn, deleted, --force images) leave no beat pointing at them
+        for i, b in enumerate(ch["beats"]):
+            if any(p.startswith("gen-") and p not in live for p in b["panels"]):
+                b["panels"] = list(b.get("fallback") or []) or _real_fallback(ch["beats"], i) or b["panels"]
     stats["generator"] = "on" if gallery.enabled else f"off ({gallery.why})"
+    stats["qc"] = gallery.qc_stats if gallery.checker else None
+    stats["cached"] = gallery.counts["cached"]
+    from . import usage
+
+    # what the cost estimate learns from: requests per chapter, cache hits, attempts and the redo rate
+    usage.record("pictures", chapters=len(chapters), asked=total_asked, quota=sum(quota), cached=gallery.counts["cached"],
+                 new=stats["generated"] - gallery.counts["cached"], attempts=gallery.counts["attempts"],
+                 first_tries=gallery.counts["first_tries"], redone=gallery.qc_stats["redone"], dropped=gallery.qc_stats["dropped"],
+                 sig=usage.image_setup_sig(cfg), generator=cfg.images.generator if gallery.enabled else "off")  # fmt: skip
+    qc = stats["qc"]
+    console.print(f"  pictures: {stats['generated']} generated ({stats['cached']} cached), {stats['fallback']} kept their real picture - "
+                  f"generator {stats['generator']}" + (f"; quality check: {qc['passed']} passed, {qc['redone']} redone, {qc['dropped']} dropped" if qc else ""))  # fmt: skip
     return stats
 
 
@@ -679,7 +918,8 @@ def book_script(project: "Project", reader: Chain, writer: Chain, key: str, unti
     skipped = [n["title"] for n in every_note if n not in all_notes]
     if skipped:
         console.print(f"  skipping non-story sections: {', '.join(skipped)}")
-    related = related_library(project, all_notes, writer)
+    web = webrefs.build(project, bible, reader) if project.source == "book" else None
+    related = related_library(project, all_notes, writer, extra=[web] if web else None)
     if until_read:
         return None
 
@@ -692,7 +932,10 @@ def book_script(project: "Project", reader: Chain, writer: Chain, key: str, unti
     else:
         targets = [max(60, int(cfg.minutes_per_chapter * cfg.words_per_minute))] * len(all_notes)
     pos = positions(len(all_notes))
-    rel_key = hashlib.sha1(json.dumps({n["cid"]: [c["pid"] for c in related.get(n["cid"], [])] for n in all_notes}).encode()).hexdigest()[:6]
+    # written chapters are keyed on the linked-adaptation panels only: online references arriving later go
+    # through the picture pass below instead of rewriting every chapter
+    rel_key = hashlib.sha1(json.dumps({n["cid"]: [c["pid"] for c in related.get(n["cid"], []) if c["kind"] != "anime still"]
+                                       for n in all_notes}).encode()).hexdigest()[:6]  # fmt: skip
     with ThreadPoolExecutor(max(1, cfg.jobs)) as pool:
         futs = [
             pool.submit(write_book_chapter, n, related.get(n["cid"], []), position, story_before(all_notes, i), previous_events(all_notes, i),
@@ -703,13 +946,23 @@ def book_script(project: "Project", reader: Chain, writer: Chain, key: str, unti
             f.result()
             progress.emit("script", k, len(futs) + 1, "written")
         raws = [f.result() for f in futs]
+    if any(c["kind"] == "anime still" for v in related.values() for c in v):
+        needy = sum(1 for raw in raws for b in raw if not b["refs"])
+        console.print(f"  picture pass: {needy} beat(s) without a real picture, matching them to the anime stills")
+        with ThreadPoolExecutor(max(1, cfg.jobs)) as pool:
+            raws = list(pool.map(lambda nr: repick_pictures(nr[0], related.get(nr[0]["cid"], []), nr[1], writer, work / "script"), zip(all_notes, raws)))
     xref = XrefStore(work)
     chapters_out = [{"cid": n["cid"], "title": n["title"], "beats": resolve_pictures(n, related.get(n["cid"], []), raw, xref)}
                     for n, raw in zip(all_notes, raws)]  # fmt: skip
     asked = sum(1 for c in chapters_out for b in c["beats"] if b.get("generate"))
     console.print(f"  wrote {len(chapters_out)} chapters in {time.time() - t0:.0f}s; {asked} beat(s) asked for a generated picture")
-    stats = fill_pictures(chapters_out, all_notes, bible, project)
-    console.print(f"  pictures: {stats['generated']} generated, {stats['reused']} reused, {stats['cards']} title cards - generator {stats['generator']}")
+    stats = fill_real_pictures(chapters_out, all_notes, project)
+    console.print(f"  pictures: {stats['reused']} filled from the chapter's own images, {stats['cards']} title cards; "
+                  f"{stats['wanted']} beat(s) want a generated picture (the images stage makes them)")  # fmt: skip
+    # the images stage picks style references from the anime episodes matched to each chapter
+    web_src = str(web.resolve()) if web else ""
+    arc = {cid: [c["pid"] for c in v if c.get("kind") == "anime still" and str(Path(c["src"]).resolve()) == web_src] for cid, v in related.items()}
+    (work / "pictures_ctx.json").write_text(json.dumps({"arc_stills": arc}), "utf-8")
     hook = hook_from_beats(chapters_out, bible, writer, cfg, work / "script" / f"hook_book_{key}_{rel_key}_{cfg.hook_words}.json") if cfg.hook else []
     progress.emit("script", len(futs) + 1, len(futs) + 1, "written")
     return {"hook": hook, "chapters": chapters_out}

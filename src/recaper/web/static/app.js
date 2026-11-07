@@ -1011,7 +1011,8 @@ async function tabMake(p) {
     estBox.append(...[
       h('div', { class: 'bigest' }, `≈ ${fmtMin(e.video.minutes)}`, e.video.parts > 1 ? h('span', { class: 'muted small' }, ` in ${e.video.parts} parts`) : null),
       h('div', {}, calls ? `${calls} model call(s) to make` : 'Everything is already read and written', e.reader.images ? ` · ${e.reader.images} panel images to read` : ''),
-      e.images.usd ? h('div', { class: 'chip warn' }, `up to $${e.images.usd.toFixed(2)} of generated images`) : null,
+      e.images.usd ? h('div', { class: 'chip warn', title: `${e.images.new} new image(s) at $${e.images.price} each (${e.images.price_source})` },
+        `≈ $${e.images.usd.toFixed(2)} of generated images${e.images.usd_max > e.images.usd ? ` (max $${e.images.usd_max.toFixed(2)})` : ''}`) : null,
       h('a', { class: 'small', href: `#/p/${enc(name)}?tab=usage` }, 'Cost details & history →')].filter(Boolean));
   };
   getDoctor().then((doctor) => {  // availability warnings arrive without holding up the page
@@ -1085,7 +1086,17 @@ function billChip(list) {
 function estimateCard(e, p) {
   if (!e || e.error) return h('div', { class: 'card tight muted small' }, `No estimate: ${e ? e.error : 'unknown'}`);
   const row = (label, value, extra = null) => h('tr', {}, h('td', { class: 'muted' }, label), h('td', {}, value, extra ? ' ' : null, extra));
-  const gen = e.images.max ? `up to ${e.images.max} images (${e.images.spec})` : (e.images.spec === 'none' ? 'off' : 'none needed (script exists)');
+  const im = e.images;
+  const money = (x) => `$${x < 1 ? x.toFixed(3) : x.toFixed(2)}`;
+  const gen = !im.on ? (im.spec === 'none' ? 'off' : 'not used (manga / manhwa use their own panels)')
+    : `~${im.new} new image(s) with ${im.spec}${im.cached ? ` · ${im.cached} reused from the last run` : ''}${im.asked > im.budget ? ` · ${im.asked} wanted, capped at ${im.budget}` : ''}`;
+  const genCost = !im.on ? null : im.price
+    ? h('span', { class: 'chip warn tiny', title: `${money(im.price)} per image incl. reference images - ${im.price_source}. Counts: ${im.basis}.` },
+      `≈ ${money(im.usd)}${im.usd_max > im.usd ? ` · max ${money(im.usd_max)}` : ''}`)
+    : h('span', { class: 'chip ok tiny', title: im.price_source }, 'no bill');
+  const refs = e.references || {};
+  const refRow = !refs.on ? null : row('Online references', !refs.fetched ? 'looked up on the first run (AniList designs + anime screenshots; then ~1 reader call per anime episode)'
+    : `${refs.designs} character designs · ${refs.stills} screenshots from ${refs.episodes} episodes${refs.reader_calls ? ` · ${refs.reader_calls} episode(s) still to describe` : ' · all described'}${refs.picture_pass ? ` · picture pass: up to ${refs.picture_pass} writer call(s)` : ''}`);
   return h('div', { class: 'card stack' },
     h('div', { class: 'section-title' }, h('h2', {}, 'Next full run (estimate)'), h('span', { class: 'muted small' },
       `${e.chapters} chapter(s) selected · ${e.unread} to read · ${e.unwritten} to write`)),
@@ -1093,7 +1104,10 @@ function estimateCard(e, p) {
       row('Reader (vision)', `~${e.reader.calls} call(s) · ~${e.reader.images} panel images sent`, billChip(e.reader.billing)),
       row('Writer', `~${e.writer.calls} call(s)`, billChip(e.writer.billing)),
       e.polisher && e.polisher.spec ? row('Polisher', `~${e.polisher.calls} call(s) · ${e.polisher.spec}`, billChip(e.polisher.billing)) : null,
-      row('Image generation', gen, e.images.usd ? h('span', { class: 'chip warn tiny' }, `≈ $${e.images.usd.toFixed(2)} max`) : null),
+      row('Image generation', gen, genCost),
+      im.on ? row('Price per image', `${money(im.price)} · ${im.price_source}`) : null,
+      im.qc && im.qc.on && im.new ? row('Quality check', `~${im.qc.calls} reader call(s) · redo rate ${Math.round(im.qc.redo_rate * 100)}% (${im.basis.startsWith('measured') ? 'measured' : 'assumed'})`) : null,
+      refRow,
       row('Voice', `~${e.voice.words.toLocaleString()} words with ${e.voice.engine} (only changed lines are re-voiced)`),
       row('Video', `~${e.video.minutes} min${e.video.parts > 1 ? ` in ${e.video.parts} parts` : ''}`),
       row('Upscaler', `${e.upscaler.mode} · ${e.upscaler.cached} panel(s) already upscaled`)))),
@@ -1120,7 +1134,8 @@ async function tabUsage(p) {
           h('td', { class: 'small' }, `${(v.chars_in / 1000).toFixed(0)}k / ${(v.chars_out / 1000).toFixed(0)}k chars`), h('td', {}, fmtDur(v.seconds))))))) : null,
       h('div', { class: 'row small muted' },
         calls ? null : h('span', {}, 'No model calls (everything cached).'),
-        r.images.ok || r.images.failed ? h('span', {}, `Images: ${r.images.ok} generated${r.images.failed ? `, ${r.images.failed} failed` : ''} (${r.images.provider})`) : null,
+        r.images.ok || r.images.failed ? h('span', {}, `Images: ${r.images.ok} generated${r.images.failed ? `, ${r.images.failed} failed` : ''} (${r.images.provider})${r.images.usd ? ` ≈ $${r.images.usd.toFixed(2)}` : ''}`) : null,
+        r.pictures && r.pictures.dropped ? h('span', {}, `Quality check: ${r.pictures.redone} redone, ${r.pictures.dropped} dropped`) : null,
         r.voice.lines ? h('span', {}, `Voice: ${r.voice.lines} new line(s) with ${r.voice.engine}`) : null,
         r.upscaled ? h('span', {}, `Upscaled ${r.upscaled} panel(s)`) : null,
         r.renders.map((x) => h('span', {}, `Rendered ${x.output}: ${x.video_minutes} min in ${fmtDur(x.seconds)} (${x.rendered}/${x.chunks} chunks new)`))));

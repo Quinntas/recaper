@@ -1102,3 +1102,98 @@ def test_long_narration_masters_in_parallel_pieces(tmp_path, monkeypatch):
     assert encode.master_audio(nar, -16.0, out) == m and m.stat().st_mtime_ns == stamp  # cached
     encode.master_audio(nar, -14.0, out)
     assert m.stat().st_mtime_ns != stamp  # loudness change re-masters
+
+
+def test_online_references_parse_match_repick_and_quality_check(tmp_path, monkeypatch):
+    import cv2
+
+    from recaper import bookflow, imagegen, webrefs
+
+    # ---- naming, wiki parsing, character matching (no network: a fake HTTP client answers the wiki API)
+    assert webrefs.series_name("", Path("Mushoku Tensei Jobless Reincarnation Light Novel")) == "Mushoku Tensei Jobless Reincarnation"
+    ep = ("{{Infobox Anime Episode\n |season = 1\n |episode = 05\n |adaptation = [[Light Novel Volume 1]]: Chapter 11<br>"
+          "[[Light Novel Volume 2]]: Prologue\n}}\n==Plot==\nRudeus meets [[Eris Boreas Greyrat|Eris]].<ref>x</ref>\n==Notes==\nno")
+    gallery = "<gallery>\nMushoten 05 01.jpg\nTrailer video\nFile:Mushoten 05 02.png|caption\n</gallery>"
+
+    class FakeHttp:
+        def json(self, method, url, params=None, **kw):
+            if params.get("list") == "categorymembers":
+                return {"query": {"categorymembers": [{"title": "A Young Lady"}]}}
+            titles = params["titles"].split("|")
+            text = {"A Young Lady": ep, "A Young Lady/Gallery": gallery}
+            return {"query": {"pages": [{"title": t, "revisions": [{"slots": {"main": {"content": text.get(t, "")}}}]} for t in titles]}}
+
+    eps = webrefs.wiki_episodes(FakeHttp(), "https://x.fandom.com/api.php")
+    assert eps[0]["episode"] == 5 and "Volume 2: Prologue" in eps[0]["adaptation"] and eps[0]["plot"] == "Rudeus meets Eris."
+    assert eps[0]["files"] == ["Mushoten 05 01.jpg", "Mushoten 05 02.png"]  # videos / captions dropped
+    anilist = [{"id": 1, "role": "MAIN", "names": ["Eris Boreas Greyrat", "Eris"], "first": "Eris", "last": "Boreas Greyrat"},
+               {"id": 2, "role": "MAIN", "names": ["Rudeus Greyrat", "Rudeus"], "first": "Rudeus", "last": "Greyrat"},
+               {"id": 3, "role": "SUPPORTING", "names": ["Paul Greyrat"], "first": "Paul", "last": "Greyrat"}]
+    m = webrefs.match_characters({"Eris Greyrat": {"aliases": ["Eris"]}, "Rudeus": {"aliases": []}, "Norn Greyrat": {"aliases": []}}, anilist)
+    assert m["Eris Greyrat"]["id"] == 1 and m["Rudeus"]["id"] == 2 and "Norn Greyrat" not in m  # same surname is not enough
+
+    # ---- picture pass: beats without a picture get a matching anime still; the text stays
+    notes = {"cid": "c0001", "title": "Roa", "labels": {"P1": "c0001-p0001"}, "panels": {"P1": {"story": True, "desc": "cover", "chars": []}}}
+    related = [{"label": "A1", "kind": "anime still", "src": "w", "pid": "c0005-p0001", "desc": "Rudeus and Eris tied up", "chars": []}]
+    raw = [{"text": "They get kidnapped.", "refs": [], "generate": "kidnapping", "chars": [], "emphasis": "normal"},
+           {"text": "The cover.", "refs": ["P1"], "generate": "", "chars": [], "emphasis": "normal"}]
+    writer = _Fake("w", json.dumps({"picks": {"1": ["A1", "ZZ9"], "2": ["A1"]}}))
+    out = bookflow.repick_pictures(notes, related, raw, Chain([writer], "writer"), tmp_path)
+    assert out[0]["refs"] == ["A1"] and out[1]["refs"] == ["P1"] and out[0]["text"] == raw[0]["text"]
+    assert bookflow.repick_pictures(notes, related, raw, Chain([writer], "writer"), tmp_path) == out and writer.calls == 1  # cached
+
+    # ---- quality check: a bad image is redone once with the problems, twice bad -> dropped and remembered
+    work = tmp_path / "w"
+    asks = []
+
+    def fake_gen(spec, prompt, refs, dest, ref_notes=None, **kw):
+        asks.append(prompt)
+        img = np.full((360, 640, 3), 120, np.uint8)
+        img[:40] = 0  # letterbox bar on a dark-ish image
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(dest), img)
+        return dest
+
+    monkeypatch.setattr(imagegen, "generate", fake_gen)
+    monkeypatch.setattr(imagegen, "available", lambda spec: (True, ""))
+    cfg = Config()
+    cfg.images.generator = "gemini"
+    judge = _Fake("qc", json.dumps({"score": 3, "problems": ["Eris has black hair"]}))
+    g = bookflow.Gallery(work, cfg, Chain([judge], "reader"))
+    assert g.generate("Eris draws her sword", []) is None and len(asks) == 2 and "Eris has black hair" in asks[1]
+    assert g.qc_stats == {"passed": 0, "redone": 1, "dropped": 1}
+    assert g.generate("Eris draws her sword", []) is None and len(asks) == 2  # rejected before: not paid again
+    good = _Fake("qc", json.dumps({"score": 8, "problems": []}))
+    g2 = bookflow.Gallery(work, cfg, Chain([good], "reader"))
+    pid = g2.generate("Rudeus casts a spell", [])
+    item = g2.by_key[next(iter(g2.by_key))]
+    assert pid and item["qc"]["score"] == 8 and item["h"] == 320  # black bar trimmed
+
+
+def test_image_cost_prediction(tmp_path):
+    from recaper import usage
+
+    # list prices at the size recaper requests, plus reference images as input tokens
+    assert usage.image_price("gemini:gemini-2.5-flash-image")[0] == 0.039
+    assert usage.image_price("gemini")[0] == 0.039  # the default model
+    assert abs(usage.image_price("gemini:gemini-3-pro-image-preview", refs=4)[0] - (0.134 + 4 * 560 * 2.0 / 1e6)) < 1e-6
+    assert usage.image_price("openai:gpt-image-1", "medium")[0] == 0.063 and usage.image_price("openai", "high")[0] == 0.25
+    assert usage.image_price("antigravity")[0] == 0.0 and usage.image_price("gemini:new-model-9")[1].startswith("new-model-9 not in")
+    assert usage.image_price("openai:gpt-image-1", override=0.1)[0] == 0.1
+
+    cfg = Config()
+    cfg.images.generator, cfg.images.max_generated, cfg.images.refs = "gemini:gemini-2.5-flash-image", 100, 4
+    e = usage.image_estimate(tmp_path, cfg, 10, True)  # no history: prior of 3 asks / chapter, 35% redone by QC
+    price = 0.039 + 4 * 560 * 0.30 / 1e6
+    assert e["asked"] == 30 and e["new"] == 30 and e["attempts"] == round(30 * 1.35)
+    assert e["usd"] == round(30 * 1.35 * price, 2) and e["usd_max"] == round(60 * price, 2) and e["qc"]["calls"] == round(30 * 1.35)
+    # measured history: 80 chapters asked for 40 pictures, 20 made with this setup, 4 of 20 redone
+    (tmp_path / "usage.jsonl").write_text(json.dumps({"kind": "pictures", "chapters": 80, "asked": 40, "cached": 0, "new": 20,
+                                                      "first_tries": 20, "redone": 4, "sig": usage.image_setup_sig(cfg)}) + "\n", "utf-8")
+    e = usage.image_estimate(tmp_path, cfg, 80, True)
+    assert e["asked"] == 40 and e["cached"] == 20 and e["new"] == 20 and e["qc"]["redo_rate"] == 0.2
+    assert e["usd"] == round(20 * 1.2 * price, 2)
+    cfg.images.style = "different"  # setup changed: nothing cached can be reused
+    assert usage.image_estimate(tmp_path, cfg, 80, True)["new"] == 40
+    cfg.images.generator = "antigravity"
+    assert usage.image_estimate(tmp_path, cfg, 80, True)["usd"] == 0.0

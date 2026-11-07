@@ -252,9 +252,11 @@ the descriptions), what is happening, the setting and the mood. Mark images that
 logos, text-only pages, ads, credits, tables of contents) as story=false.
 Reply with ONLY a JSON object: {"panels": [{"id": "P1", "story": true, "weight": 3, "desc": "...", "chars": ["Name"]}]}"""
 
-MAP_SYSTEM = """You match chapters of a book / light novel to the chapters of its adaptation (manga, manhwa...) that show
-the SAME events. Adaptations move at a different pace: one book chapter can span several adaptation chapters
-and vice versa. Only list genuinely overlapping chapters; use [] when none overlap.
+MAP_SYSTEM = """You match chapters of a book / light novel to the chapters of its adaptation (manga, manhwa, anime
+episodes...) that show the SAME events. Adaptations move at a different pace: one book chapter can span several
+adaptation chapters and vice versa. Use the volume hints when given (an anime episode that "adapts Light Novel
+Volume 2: Chapter 1-2" only matches chapters of volume 2 with those events). Only list genuinely overlapping
+chapters; use [] when none overlap.
 Reply with ONLY a JSON object: {"map": {"<book chapter id>": ["<adaptation chapter key>", ...]}}"""
 
 BOOK_WRITER_SYSTEM = """You write narration scripts for long-form recap videos of light novels / books.
@@ -263,7 +265,8 @@ shown while it is read. The picture should change about every 20-25 words.
 
 PICTURES - for every beat choose ONE of:
 - "panels": 1-3 labels from the IMAGE LIBRARY that fit what the sentence describes. P* = the book's own
-  illustrations (best), R* = panels of the adaptation showing the same scene (great). Re-using a fitting image
+  illustrations (best), R* = panels of the adaptation showing the same scene (great), A* = frames of the anime
+  adaptation (great when they show the same moment and the right characters). Re-using a fitting image
   for a couple of consecutive beats is fine.
 - "generate": when nothing in the library fits a key moment, a concrete visual description of the scene to
   illustrate (characters by name with their look, action, setting, mood, camera framing), no text in the image.
@@ -327,3 +330,25 @@ stood at the end of the last part - so the new part makes sense on its own. Star
 "Previously," then tell it plainly, like a person catching a friend up (third person, no questions, no
 dramatic trailer voice). For pictures pick 1-2 ids per beat from the IMAGES list.
 Reply with ONLY a JSON object: {"beats": [{"text": "...", "panels": ["id"], "emphasis": "normal"}]}"""
+
+
+PICTURE_SYSTEM = """You choose the pictures for one chapter of a narrated recap video. You get the chapter's narration
+beats, numbered, and an IMAGE LIBRARY (label: what the image shows). Beats marked [needs picture] have none yet.
+For each of those, pick 1-2 library labels that show what the beat describes: the same characters (right people,
+right age and look) doing the same thing, or the same place and moment. A close match of the moment beats a
+loose match of the characters. If nothing really fits, give [] - a wrong picture is worse than none.
+Spread the choices: don't use one image for more than 3 beats.
+Reply with ONLY a JSON object: {"picks": {"<beat number>": ["R3"], "<beat number>": []}}"""
+
+QC_SYSTEM = """You are the picture editor of a narrated recap video. You check ONE generated image (the last image)
+against the scene it must show and the reference images before it (official character designs and frames from
+the anime/illustrations of the work).
+Score 1-10:
+ 9-10  could pass for an official illustration or anime frame of this scene
+ 7-8   good: the right characters, on-model, matches the scene; only small flaws
+ 5-6   usable but clearly off: generic faces, wrong hair/outfit/age, stiff or bland, weak match to the scene
+ 1-4   reject: wrong or unrecognisable characters, deformed anatomy (hands, faces, extra limbs), text, letters,
+       speech bubbles or watermarks, borders or letterbox bars, a collage or comic panels, a different art
+       style, broken props, or it shows a different moment
+Be strict about the characters' look matching the designs (hair colour and style, eye colour, outfit, age).
+Reply with ONLY a JSON object: {"score": 7, "problems": ["short, concrete problem", "..."]}"""

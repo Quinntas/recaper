@@ -447,8 +447,10 @@ def create_app(library: Path) -> FastAPI:
     @app.post("/api/projects/{name}/run")
     def run(name: str, body: RunBody):
         p = project_dir(name)
-        if body.until not in ("panels", "read", "script", "voice", "render"):
+        if body.until not in ("panels", "read", "script", "images", "voice", "render"):
             raise HTTPException(400, "bad stage")
+        if any(f not in ("panels", "read", "script", "images", "voice", "render") for f in body.force):
+            raise HTTPException(400, "bad stage to redo")
         if body.output and not re.match(r"^[\w .()-]{1,80}\.mp4$", body.output):
             raise HTTPException(400, "output must be a simple .mp4 file name")
         if body.chapters and not re.match(r"^\s*\d+(\s*-\s*\d*)?(\s*,\s*\d+(\s*-\s*\d*)?)*\s*$", body.chapters):
@@ -873,6 +875,82 @@ def create_app(library: Path) -> FastAPI:
             "generator": {"spec": cfg.images.generator, "available": ok, "detail": why, "max": cfg.images.max_generated},
             "generated": [{"id": g["id"], "prompt": g.get("prompt", "")} for g in generated],
         }
+
+    def _gen_state(p: Path) -> tuple[dict, list[dict], dict, dict]:
+        work = p / WORK_DIR_NAME
+        script = json.loads((work / "script.json").read_text("utf-8")) if (work / "script.json").exists() else {}
+        gdir = work / "panels" / "gen"
+        items = {g["id"]: g for g in json.loads((gdir / "panels.json").read_text("utf-8"))} if (gdir / "panels.json").exists() else {}
+        rejected = json.loads((gdir / "rejected.json").read_text("utf-8")) if (gdir / "rejected.json").exists() else {}
+        reqs = []
+        for ci, ch in enumerate(script.get("chapters") or []):
+            for bi, b in enumerate(ch["beats"]):
+                if not b.get("generate"):
+                    continue
+                gen = next((items[x] for x in b["panels"] if x in items), None)
+                scene = f"Scene: {b['generate']}"
+                rej = next((r for r in rejected.values() if str(r.get("prompt", "")).startswith(scene)), None)
+                reqs.append({
+                    "ci": ci, "bi": bi, "cid": ch["cid"], "chapter": ch["title"], "text": b["text"], "request": b["generate"],
+                    "panel": gen["id"] if gen else (b["panels"][0] if b["panels"] else None), "fallback": b.get("fallback") or [],
+                    "status": "generated" if gen else ("rejected" if rej else "real"), "queued": bool(b.get("regen")),
+                    "prompt": gen.get("prompt") if gen else None, "qc": (gen or rej or {}).get("qc"),
+                })  # fmt: skip
+        return script, reqs, items, rejected
+
+    @app.get("/api/projects/{name}/generated")
+    def generated_images(name: str):
+        """Every picture the script asked the generator for: what it shows now (generated or its real fallback)."""
+        from ..imagegen import available
+
+        p = project_dir(name)
+        cfg = Config.load(p, {})
+        script, reqs, items, rejected = _gen_state(p)
+        ok, why = available(cfg.images.generator)
+        used = {r["panel"] for r in reqs}
+        job = jobs.active_for(name)
+        return {
+            "has_script": bool(script), "requests": reqs, "unused": [g for g in items if g not in used], "rejected": len(rejected),
+            "generator": {"spec": cfg.images.generator, "available": ok, "detail": why, "max": cfg.images.max_generated,
+                          "quality_check": cfg.images.quality_check},
+            "job": job.view(len(job.log)) | {"log": []} if job else None,
+        }  # fmt: skip
+
+    class RedoBody(BaseModel):
+        mode: str = "missing"  # missing | all | some
+        beats: list[list[int]] = []  # [[chapter index, beat index], ...] for "some"
+        requests: dict[str, str] = {}  # "ci:bi" -> edited scene description
+
+    @app.post("/api/projects/{name}/generated/redo")
+    def redo_generated(name: str, body: RedoBody):
+        """Images-only run: make the missing pictures, redraw everything, or redraw the chosen beats."""
+        p = project_dir(name)
+        if body.mode not in ("missing", "all", "some"):
+            raise HTTPException(400, "mode must be missing, all or some")
+        if jobs.active_for(name):
+            raise HTTPException(409, "this project already has a run queued or going - wait for it to finish")
+        script, reqs, _, _ = _gen_state(p)
+        if not script:
+            raise HTTPException(404, "no script yet - make the script first")
+        if not reqs:
+            raise HTTPException(400, "the script asks for no generated pictures")
+        if body.mode == "some":
+            wanted = {(r["ci"], r["bi"]) for r in reqs}
+            picked = {(int(c), int(b)) for c, b in body.beats if (int(c), int(b)) in wanted}
+            if not picked:
+                raise HTTPException(400, "pick at least one picture request")
+            for ci, bi in picked:
+                beat = script["chapters"][ci]["beats"][bi]
+                beat["regen"] = True
+                edit = (body.requests.get(f"{ci}:{bi}") or "").strip()
+                if edit:
+                    beat["generate"] = edit[:1200]
+            (p / WORK_DIR_NAME / "script.json").write_text(json.dumps(script, ensure_ascii=False, indent=1), "utf-8")
+        try:
+            job = jobs.run_pipeline(name, p, "images", ["images"] if body.mode == "all" else [], False, None)
+        except RuntimeError as e:
+            raise HTTPException(409, str(e)) from e
+        return job.view()
 
     @app.get("/api/projects/{name}/related")
     def related(name: str, q: str | None = None, lang: str = "en"):

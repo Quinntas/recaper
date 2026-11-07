@@ -60,20 +60,24 @@ def _ref_bytes(path: Path, max_edge: int = 1024) -> bytes:
         return buf.getvalue()
 
 
-def generate(spec: str, prompt: str, refs: list[Path], dest: Path) -> Path:
-    """Generate one 16:9 image to `dest` (PNG). Raises ImageGenError."""
+def generate(spec: str, prompt: str, refs: list[Path], dest: Path, ref_notes: list[str] | None = None,
+             quality: str = "high", price_override: float = 0.0) -> Path:
+    """Generate one 16:9 image to `dest` (PNG). `ref_notes` says what each reference is. Raises ImageGenError."""
     ok, why = available(spec)
     if not ok:
         raise ImageGenError(why)
     name, _, model = spec.partition(":")
     name = name.lower()
     dest.parent.mkdir(parents=True, exist_ok=True)
-    full = (
-        f"{prompt}\n\nUse the attached reference images (official art of this work) for the art style and for how "
-        "the characters look. Widescreen 16:9 composition. No text, no speech bubbles, no captions, no watermark."
-        if refs
-        else f"{prompt}\n\nWidescreen 16:9 composition. No text, no speech bubbles, no captions, no watermark."
-    )
+    rules = ("Widescreen 16:9, one single scene filling the whole frame (no borders, bars, panels or collage). "
+             "No text, letters, speech bubbles, captions or watermark. Clean anatomy: correct hands and faces.")
+    if refs and ref_notes:
+        listed = "\n".join(f"- reference image {i + 1}: {n}" for i, n in enumerate(ref_notes[: len(refs)]))
+        full = f"{prompt}\n\nThe attached reference images, in order:\n{listed}\nKeep every character on-model with their design.\n{rules}"
+    elif refs:
+        full = f"{prompt}\n\nUse the attached reference images (official art of this work) for the art style and for how the characters look.\n{rules}"
+    else:
+        full = f"{prompt}\n\n{rules}"
     from . import usage
 
     t0 = time.time()
@@ -83,13 +87,14 @@ def generate(spec: str, prompt: str, refs: list[Path], dest: Path) -> Path:
         elif name == "gemini":
             data = _gemini(model or "gemini-2.5-flash-image", full, refs)
         else:
-            data = _openai(model or "gpt-image-1", full, refs)
+            data = _openai(model or "gpt-image-1", full, refs, quality)
     except Exception as e:  # noqa: BLE001 - surface provider errors uniformly
         usage.record("image", provider=spec, outcome="failed", refs=len(refs), seconds=round(time.time() - t0, 1), error=str(e)[:200])
         if isinstance(e, ImageGenError):
             raise
         raise ImageGenError(f"{name}: {e}") from e
-    usage.record("image", provider=spec, outcome="ok", refs=len(refs), seconds=round(time.time() - t0, 1))
+    price, _ = usage.image_price(spec, quality, len(refs), price_override)
+    usage.record("image", provider=spec, outcome="ok", refs=len(refs), seconds=round(time.time() - t0, 1), usd=price)
     with Image.open(io.BytesIO(data)) as im:
         im.convert("RGB").save(dest, "PNG")
     return dest
@@ -125,15 +130,15 @@ def _gemini(model: str, prompt: str, refs: list[Path]) -> bytes:
     raise ImageGenError("gemini returned no image (possibly blocked by its safety filter)")
 
 
-def _openai(model: str, prompt: str, refs: list[Path]) -> bytes:
+def _openai(model: str, prompt: str, refs: list[Path], quality: str = "high") -> bytes:
     import openai
 
     client = openai.OpenAI()
     if refs:
         files = [(r.name, _ref_bytes(r), "image/png") for r in refs]
-        resp = client.images.edit(model=model, image=files, prompt=prompt, size="1536x1024")
+        resp = client.images.edit(model=model, image=files, prompt=prompt, size="1536x1024", quality=quality)
     else:
-        resp = client.images.generate(model=model, prompt=prompt, size="1536x1024")
+        resp = client.images.generate(model=model, prompt=prompt, size="1536x1024", quality=quality)
     b64 = resp.data[0].b64_json if resp.data else None
     if not b64:
         raise ImageGenError("openai returned no image")

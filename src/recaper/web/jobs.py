@@ -20,8 +20,8 @@ from typing import Any, Callable
 from ..progress import PREFIX
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-STAGE_WEIGHTS = {"panels": 5, "read": 35, "script": 12, "voice": 13, "render": 35}
-STAGE_ORDER = ["panels", "read", "script", "voice", "render"]
+STAGE_WEIGHTS = {"panels": 5, "read": 32, "script": 12, "images": 8, "voice": 12, "render": 31}
+STAGE_ORDER = ["panels", "read", "script", "images", "voice", "render"]
 
 
 @dataclass
@@ -97,7 +97,7 @@ class JobManager:
                      quick: bool = False, chapters: str | None = None) -> Job:
         if self.active_for(project):
             raise RuntimeError("this project already has a video queued or running")
-        title = "Quick preview" if quick else (f"Make video ({until})" if until != "render" else "Make video")
+        title = "Quick preview" if quick else {"render": "Make video", "images": "Generate images"}.get(until, f"Make video ({until})")
         if chapters:
             title += f" · ch {chapters}"
         job = self._new("pipeline", project, title)

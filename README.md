@@ -119,9 +119,27 @@ source). Projects that are mostly prose switch to book mode automatically; you c
    linked automatically. Linked projects are cut and read with their own settings. One model call then
    matches each book chapter to the adaptation chapters showing the same events, and the writer picks
    fitting panels beat by beat.
-4. **Generation for the gaps.** When no image fits a key moment, the writer describes the scene and
-   `images.generator` draws it. The work's own art (illustrations, linked panels, cover) is sent as style and
-   character references. Generators:
+4. **Online references** (`images.web = "auto"`). The series is looked up online once and cached in
+   `.recaper/web/`:
+   - **Character designs:** official character art from AniList, matched to the story bible's names. These
+     are the identity references for generation.
+   - **Anime screenshots:** pulled from every episode gallery of the series' Fandom wiki, with the episode's
+     plot and the light-novel volume and chapters it adapts. The wiki is guessed from the title, or set
+     `images.wiki` yourself. The vision reader describes the screenshots, about 15 per call. Episodes are
+     then matched to book chapters like a linked adaptation, and the writer can pick them as `A*` pictures.
+   - **Already-written chapters:** they keep their text. A picture pass gives their picture-less beats a
+     fitting screenshot, at one cheap call per chapter.
+
+   For Mushoku Tensei that's 59 episodes, about 1,000 screenshots, and designs for 75 characters.
+5. **Generation for the gaps.** When no image fits a key moment, the writer describes the scene and
+   `images.generator` draws it.
+   - **References:** the official design of every character in the scene, then colour frames from the
+     anime episodes of the same arc (right ages and outfits). The book's black-and-white illustrations are
+     only a last resort.
+   - **Quality check** (`images.quality_check`): the reader scores each image 1-10 against the scene and
+     the designs. Images below `images.min_score` (default 7) are redone once with the problems listed. A
+     second failure is dropped and remembered, and the beat gets a real picture instead.
+   - **Generators:**
    - `antigravity`: your Google AI plan through Antigravity, **no API key**. It uses the agent's built-in
      `generate_image` tool; that tool is the only one recaper allows, everything else is refused. About a minute
      per image, 4 at a time. The tool can't take reference images, so the model describes their style in words:

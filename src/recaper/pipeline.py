@@ -1,6 +1,6 @@
 """Stage orchestration with on-disk caching under <input>/.recaper/.
 
-Stages: panels -> read -> script -> voice -> render. Every stage reuses what's already on disk,
+Stages: panels -> read -> script -> images (books only) -> voice -> render. Every stage reuses what's already on disk,
 so a crashed or interrupted run resumes, and editing script.json only re-voices / re-renders
 the beats that changed.
 """
@@ -39,7 +39,7 @@ from .story import (
 )
 from .tts import Voice, load_audio, voice_all
 
-STAGES = ["panels", "read", "script", "voice", "render"]
+STAGES = ["panels", "read", "script", "images", "voice", "render"]
 
 
 def _slug(text: str) -> str:
@@ -70,6 +70,7 @@ class Project:
             "panels": ["panels", "read_tiles", "notes", "script", "script.json", "manifest.json"],
             "read": ["notes", "script", "script.json"],
             "script": ["script", "script.json"],
+            "images": ["panels/gen"],  # every generated picture (and the quality-check rejects): all are made again
             "voice": ["audio"],
             "render": ["render"],
         }
@@ -157,9 +158,12 @@ class Project:
     def stage_script(self, until_read: bool = False) -> dict:
         script_path = self.work / "script.json"
         key = self._selection_key()
-        # hook/outro only affect assembly: they must not invalidate the (expensive) chapter scripts
+        # hook/outro only affect assembly: they must not invalidate the (expensive) chapter scripts. Generator
+        # settings (model, style, budget, quality check) belong to the images stage and don't touch the script.
+        ic = self.cfg.images
+        script_images = [ic.related_per_chapter, ic.web, ic.series, ic.wiki, ic.web_max]
         assembly = key + hashlib.sha1(
-            json.dumps([self.cfg.hook, self.cfg.hook_words, self.cfg.outro, self.cfg.image_sources, asdict(self.cfg.images), self.cfg.polish] + ([self.cfg.polisher] if self.cfg.polisher else [])).encode()
+            json.dumps([self.cfg.hook, self.cfg.hook_words, self.cfg.outro, self.cfg.image_sources, script_images, self.cfg.polish] + ([self.cfg.polisher] if self.cfg.polisher else [])).encode()
         ).hexdigest()[:6]
         if script_path.exists():
             existing = json.loads(script_path.read_text("utf-8"))
@@ -210,6 +214,27 @@ class Project:
             f"script: {script_path}  ({words} words, ~{words / self._pace():.0f} min) - "
             "edit it freely, then re-run to voice/render the changes"
         )
+        return script
+
+    # ---------------------------------------------------------------- images
+    def stage_images(self, script: dict) -> dict:
+        """Books: draw the pictures the script asked for (cached by prompt + references, so a re-run only makes
+        what is missing). Generated ids are written into script.json; each beat keeps its real "fallback"."""
+        if self.source != "book" or not script.get("chapters"):
+            return script
+        if not any(b.get("generate") for c in script["chapters"] for b in c["beats"]):
+            progress.emit("images", 1, 1, "no pictures requested")
+            return script
+        from . import bookflow
+
+        checker = None
+        if self.cfg.images.quality_check:
+            try:
+                checker = make_chain(self.cfg.reader, "image check", need_vision=True)
+            except ValueError as e:
+                console.print(f"[yellow]image quality check off: {e}[/]")
+        bookflow.generate_pictures(self, script, checker)
+        (self.work / "script.json").write_text(json.dumps(script, ensure_ascii=False, indent=1), "utf-8")
         return script
 
 

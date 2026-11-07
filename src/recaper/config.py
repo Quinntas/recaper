@@ -92,8 +92,16 @@ class ImagesConfig:
     generator: str = "none"  # none | gemini[:model] | openai[:model] | antigravity[:model] - fills beats no real image fits
     style: str = "official light-novel illustration style, clean anime line art, soft colours, cinematic composition"
     max_generated: int = 40  # cap per video (cost control); beyond it the nearest real image is reused
-    refs: int = 3  # reference images (official art) sent with each generation for style/character consistency
+    refs: int = 4  # reference images sent with each generation: character designs first, then style (anime stills / art)
     related_per_chapter: int = 80  # max related-work panels offered to the writer per chapter
+    web: str = "auto"  # online references (book mode): AniList character designs + anime screenshots from the series' wiki | off
+    series: str = ""  # title to look up online (default: the project folder name without "Light Novel", "Vol" ...)
+    wiki: str = ""  # Fandom wiki to take screenshots from: subdomain ("mushokutensei") or URL (default: guessed from the title)
+    web_max: int = 1500  # max screenshots downloaded (each episode's gallery, in airing order)
+    quality_check: bool = True  # the vision reader scores every generated image; bad ones are redone once, then dropped
+    min_score: int = 7  # quality-check pass mark (1-10)
+    quality: str = "high"  # OpenAI image quality: low | medium | high (decides its price); Gemini ignores it
+    price: float = 0.0  # USD per generated image for cost estimates; 0 = the built-in list price of the model
 
 
 @dataclass

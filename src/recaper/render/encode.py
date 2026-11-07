@@ -125,7 +125,8 @@ def master_audio(narration: Path, loudness: float, render_dir: Path, workers: in
     duration = info.frames / info.samplerate
     tmp = render_dir / "narration_master.tmp.m4a"
     afilter = _afilter(loudness)
-    cuts = quiet_cuts(narration) if duration > 1.5 * SEGMENT_SECONDS else []
+    offset = pcm16_data_offset(narration) if duration > 1.5 * SEGMENT_SECONDS else None
+    cuts = quiet_cuts(narration) if offset is not None else []
     if not cuts:
         _ffmpeg(["-i", str(narration), "-af", afilter, *_aac_args(), str(tmp)], "audio master", timeout=900 + duration / 10)
     else:
@@ -134,7 +135,7 @@ def master_audio(narration: Path, loudness: float, render_dir: Path, workers: in
 
         def piece(i: int) -> None:
             a, b = bounds[i]
-            _ffmpeg_from_pcm(narration, a, b, ["-af", afilter, "-ar", str(info.samplerate), "-c:a", "flac", str(pieces[i])],
+            _ffmpeg_from_pcm(narration, offset, info.samplerate, info.channels, a, b, ["-af", afilter, "-ar", str(info.samplerate), "-c:a", "flac", str(pieces[i])],
                              f"audio master piece {i + 1}/{len(bounds)}", timeout=600 + (b - a) / info.samplerate / 10)  # fmt: skip
 
         workers = workers or max(2, min(6, (os.cpu_count() or 4) // 4))  # the video chunks render at the same time
@@ -153,28 +154,50 @@ def master_audio(narration: Path, loudness: float, render_dir: Path, workers: in
     return master
 
 
-def _ffmpeg_from_pcm(src: Path, a: int, b: int, out_args: list[str], what: str, timeout: float) -> None:
-    """Feed samples [a, b) of `src` to ffmpeg as raw PCM: sample-exact, unlike seeking by timestamp."""
-    import tempfile
-    import time
+def pcm16_data_offset(path: Path) -> int | None:
+    """Byte offset of the samples in a 16-bit PCM WAV / RF64 (what the voice stage writes), else None."""
+    import struct
 
     import soundfile as sf
 
-    with sf.SoundFile(str(src)) as f, tempfile.TemporaryFile() as err:
-        cmd = [ffmpeg_bin(), "-v", "error", "-y", "-f", "s16le", "-ar", str(f.samplerate), "-ac", str(f.channels), "-i", "-", *out_args]
+    if sf.info(str(path)).subtype != "PCM_16":
+        return None
+    with open(path, "rb") as f:
+        head = f.read(1 << 16)
+    if head[:4] not in (b"RIFF", b"RF64") or head[8:12] != b"WAVE":
+        return None
+    pos = 12
+    while pos + 8 <= len(head):
+        cid, size = head[pos : pos + 4], struct.unpack("<I", head[pos + 4 : pos + 8])[0]
+        if cid == b"data":
+            return pos + 8
+        pos += 8 + size + (size & 1)
+    return None
+
+
+def _ffmpeg_from_pcm(src: Path, offset: int, sr: int, channels: int, a: int, b: int, out_args: list[str], what: str,
+                     timeout: float) -> None:  # fmt: skip
+    """Feed samples [a, b) of a 16-bit PCM file to ffmpeg as raw PCM: sample-exact, unlike seeking by timestamp.
+    Plain file reads, not libsndfile: its seeks failed ("psf_fseek() failed") with several pieces in flight."""
+    import tempfile
+    import time
+
+    frame = 2 * channels
+    with open(src, "rb") as f, tempfile.TemporaryFile() as err:
+        cmd = [ffmpeg_bin(), "-v", "error", "-y", "-f", "s16le", "-ar", str(sr), "-ac", str(channels), "-i", "-", *out_args]
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err)
         deadline = time.time() + timeout
         try:
-            f.seek(a)
-            left = b - a
+            f.seek(offset + a * frame)
+            left = (b - a) * frame
             while left > 0:
                 if time.time() > deadline:
                     raise subprocess.TimeoutExpired(cmd, timeout)
-                block = f.read(min(left, f.samplerate * 30), dtype="int16")
-                if not len(block):
+                block = f.read(min(left, sr * 30 * frame))
+                if not block:
                     break
                 try:
-                    proc.stdin.write(block.tobytes())
+                    proc.stdin.write(block)
                 except OSError:  # ffmpeg exited early: its stderr says why
                     break
                 left -= len(block)
