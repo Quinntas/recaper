@@ -548,7 +548,7 @@ async function viewProject(name, tab) {
   const page = STATE.page;
   const p = await api(`/api/projects/${enc(name)}`);
   const tabs = [['make', 'Make video'], ['videos', `Videos${p.videos.length ? ` (${p.videos.length})` : ''}`], ['script', 'Script'], ['chapters', `Chapters (${p.chapters})`],
-    ['options', 'Options'], ['images', 'Images'], ['panels', 'Panels'], ['usage', 'Usage']];
+    ['options', 'Options'], ['images', 'Images'], ...(p.detected_source === 'book' ? [['generated', 'Generated']] : []), ['panels', 'Panels'], ['usage', 'Usage']];
   const tabLabel = { make: 'Make video', options: 'Options', script: 'Script', videos: 'Videos', chapters: 'Chapters', images: 'Images', panels: 'Panels', usage: 'Usage' }[tab] || 'Make video';
   page.title = `${p.name} · ${tabLabel}`;
   const body = h('div', {});
@@ -571,7 +571,7 @@ async function viewProject(name, tab) {
         h('button', { class: 'ghost', title: 'Delete project, cache or videos…', onclick: () => deleteProjectModal(name) }, '🗑'))),
     h('div', { class: 'tabs' }, tabs.map(([id, label]) => h('a', { href: `#/p/${enc(name)}?tab=${id}`, class: tab === id ? 'active' : '' }, label))),
     body);
-  const renderers = { make: tabMake, options: tabOptions, script: tabScript, videos: tabVideos, chapters: tabChapters, images: tabImages, panels: tabPanels, usage: tabUsage };
+  const renderers = { make: tabMake, options: tabOptions, script: tabScript, videos: tabVideos, chapters: tabChapters, images: tabImages, generated: tabGenerated, panels: tabPanels, usage: tabUsage };
   body.append(await (renderers[tab] || tabMake)(p));
   return view;
 }
@@ -1848,6 +1848,120 @@ async function tabImages(p) {
         h('a', { class: 'small', href: `#/p/${enc(p.name)}?tab=options` }, 'Generator settings →')),
       h('p', { class: 'muted small', style: { margin: 0 } }, `When no real image fits a key moment, the writer describes the scene and the generator draws it using the work's own art (cover, illustrations, linked panels) as style and character reference - up to ${gen.max} per video. Hover an image to see its prompt.`),
       gallery));
+}
+
+// --------------------------------------------------------------- generated
+async function tabGenerated(p) {
+  const name = p.name;
+  const data = await api(`/api/projects/${enc(name)}/generated`);
+  const gen = data.generator;
+  const jobBox = h('div', {});
+  const picked = new Map();  // "ci:bi" -> request
+  const edits = {};
+  let filter = lsGet('rc.genFilter', 'all');
+  const reqs = data.requests;
+  const counts = { all: reqs.length, generated: 0, real: 0, rejected: 0 };
+  for (const r of reqs) counts[r.status] = (counts[r.status] || 0) + 1;
+  const imgUrl = (pid) => `/api/projects/${enc(name)}/panel/${enc(pid)}`;
+
+  const start = async (mode) => {
+    if (mode === 'all' && !confirm(`Redraw all ${counts.generated} generated picture(s)? This pays for every image again.`)) return;
+    try {
+      const body = { mode };
+      if (mode === 'some') {
+        body.beats = [...picked.values()].map((r) => [r.ci, r.bi]);
+        body.requests = Object.fromEntries(Object.entries(edits).filter(([k]) => picked.has(k)));
+      }
+      const job = await api(`/api/projects/${enc(name)}/generated/redo`, { json: body });
+      picked.clear(); drawBar();
+      watchJob(job.id, jobBox, { project: name, showLog: false, onDone: (j) => j.status === 'done' && render() });
+    } catch (e) { toast(e.message, 'bad'); }
+  };
+
+  const bar = h('div', { class: 'row genbar' });
+  const drawBar = () => {
+    bar.innerHTML = '';
+    bar.append(...[
+      h('span', { class: 'muted small' }, picked.size ? `${picked.size} selected` : 'Click pictures to select them'),
+      picked.size ? h('button', { class: 'primary', onclick: () => start('some') }, `↻ Redraw ${picked.size}`) : null,
+      picked.size ? h('button', { onclick: () => { picked.clear(); grid.querySelectorAll('.gcard.sel').forEach((c) => c.classList.remove('sel')); drawBar(); } }, 'Clear') : null].filter(Boolean));
+  };
+
+  const statusChip = (r) => ({
+    generated: h('span', { class: 'chip ok tiny' }, r.qc && r.qc.score ? `generated · ${Math.round(r.qc.score)}/10` : 'generated'),
+    rejected: h('span', { class: 'chip bad tiny', title: (r.qc && r.qc.problems || []).join('; ') }, `rejected${r.qc && r.qc.score ? ` · ${Math.round(r.qc.score)}/10` : ''}`),
+    real: h('span', { class: 'chip tiny' }, 'real picture (not generated yet)'),
+  })[r.status];
+
+  const card = (r) => {
+    const key = `${r.ci}:${r.bi}`;
+    const ta = h('textarea', { rows: 3, value: edits[key] ?? r.request, oninput: (e) => {
+      if (e.target.value.trim() !== r.request) edits[key] = e.target.value; else delete edits[key];
+      if (!picked.has(key)) { picked.set(key, r); el.classList.add('sel'); drawBar(); }
+    } });
+    const el = h('div', { class: `gcard${picked.has(key) ? ' sel' : ''}` },
+      h('div', { class: 'gimg' }, r.panel ? h('img', { src: imgUrl(r.panel), loading: 'lazy', decoding: 'async', alt: '' }) : null,
+        h('span', { class: 'gtick' }, '✓'),
+        r.queued ? h('span', { class: 'chip warn tiny gq' }, 'queued') : null),
+      h('div', { class: 'gmeta' },
+        h('div', { class: 'row' }, statusChip(r), h('span', { class: 'faint small ell' }, r.chapter)),
+        h('div', { class: 'small gline' }, `“${r.text}”`),
+        r.qc && r.qc.problems && r.qc.problems.length ? h('div', { class: 'small bad-text' }, r.qc.problems.join(' · ')) : null,
+        h('details', {}, h('summary', { class: 'small' }, 'Scene description'), ta,
+          r.fallback.length && r.status === 'generated' ? h('div', { class: 'faint small' }, 'Without it the beat shows ', h('a', { href: imgUrl(r.fallback[0]), target: '_blank' }, 'this real picture'), '.') : null)));
+    el.querySelector('.gimg').onclick = () => {
+      if (picked.has(key)) { picked.delete(key); el.classList.remove('sel'); } else { picked.set(key, r); el.classList.add('sel'); }
+      drawBar();
+    };
+    return el;
+  };
+
+  const grid = h('div', { class: 'ggrid' });
+  const PAGE = 120;
+  const drawGrid = () => {
+    grid.innerHTML = '';
+    const list = reqs.filter((r) => filter === 'all' || r.status === filter);
+    if (!list.length) { grid.append(h('div', { class: 'muted' }, 'Nothing here.')); return; }
+    let shown = 0;
+    const more = h('button', { class: 'gmore' });
+    const page = () => {
+      more.remove();
+      for (const r of list.slice(shown, shown + PAGE)) grid.append(card(r));
+      shown = Math.min(list.length, shown + PAGE);
+      if (shown < list.length) { more.textContent = `Show more (${list.length - shown} left)`; grid.append(more); }
+    };
+    more.onclick = page;
+    page();
+  };
+  const filters = segmented([['all', `All (${counts.all})`], ['generated', `Generated (${counts.generated})`], ['real', `Waiting (${counts.real})`],
+    ['rejected', `Rejected (${counts.rejected})`]], filter, (v) => { filter = v; lsSet('rc.genFilter', v); drawGrid(); });
+  drawBar(); drawGrid();
+  if (data.job) watchJob(data.job.id, jobBox, { project: name, showLog: false, onDone: (j) => j.status === 'done' && render() });
+
+  if (!data.has_script) {
+    return h('div', { class: 'card empty' }, h('h2', {}, 'No script yet'),
+      h('p', { class: 'muted' }, 'Pictures are generated after the script is written: the writer marks the moments no real image fits.'),
+      h('a', { class: 'btn primary', href: `#/p/${enc(name)}?tab=make` }, '🎬 Make video'));
+  }
+  const missing = counts.real;
+  return h('div', { class: 'stack' },
+    h('div', { class: 'card stack' },
+      h('div', { class: 'section-title' }, h('h2', {}, 'Generated pictures'),
+        h('span', { class: `chip ${gen.available ? 'ok' : (gen.spec === 'none' ? '' : 'warn')}` }, gen.spec === 'none' ? 'generator off' : `${gen.spec}${gen.available ? '' : ' unavailable'}`),
+        gen.quality_check ? h('span', { class: 'chip tiny' }, 'quality check on') : null,
+        h('div', { class: 'spacer' }), h('a', { class: 'small', href: `#/p/${enc(name)}?tab=options` }, 'Generator settings →')),
+      gen.detail ? h('div', { class: 'chip warn' }, gen.detail) : null,
+      h('p', { class: 'muted small', style: { margin: 0 } },
+        `The script asked for ${reqs.length} generated picture(s); ${counts.generated} are drawn (budget ${gen.max} per video). The rest show a real picture from their chapter.`,
+        ' Generating is its own step: redrawing never rewrites the script, and the next video uses the new pictures.'),
+      h('div', { class: 'row' },
+        h('button', { class: 'primary', disabled: !missing || !gen.available, onclick: () => start('missing') }, missing ? `Generate missing (${missing})` : 'Nothing missing'),
+        h('button', { disabled: !counts.generated || !gen.available, onclick: () => start('all') }, '↻ Redraw all'),
+        data.rejected ? h('span', { class: 'muted small' }, `${data.rejected} picture(s) failed the quality check twice and are skipped; select them to try again.`) : null),
+      jobBox),
+    h('div', { class: 'row' }, filters, h('div', { class: 'spacer' }), bar),
+    grid,
+    data.unused.length ? h('div', { class: 'muted small' }, `${data.unused.length} older generated picture(s) are no longer used by the script.`) : null);
 }
 
 async function tabPanels(p) {

@@ -139,6 +139,11 @@ source). Projects that are mostly prose switch to book mode automatically; you c
    - **Quality check** (`images.quality_check`): the reader scores each image 1-10 against the scene and
      the designs. Images below `images.min_score` (default 7) are redone once with the problems listed. A
      second failure is dropped and remembered, and the beat gets a real picture instead.
+   - **Its own stage:** `--until images` (and `--force images` to redraw everything) runs after the script.
+     The project's **Generated** tab (book projects) shows every picture request: the image it got, its
+     quality-check score and problems, and the line it illustrates. From there you can *Generate missing*,
+     *Redraw all*, or select pictures, optionally edit their scene description, and redraw just those. The
+     script is never rewritten, and each beat keeps its real picture as a fallback.
    - **Generators:**
    - `antigravity`: your Google AI plan through Antigravity, **no API key**. It uses the agent's built-in
      `generate_image` tool; that tool is the only one recaper allows, everything else is refused. About a minute
